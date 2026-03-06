@@ -1250,6 +1250,31 @@ func main() {
 	go cs.replicaVoteLoop()
 	go cs.peerHealthCheck()
 
+	if len(cs.nodeAddrs) > 0 {
+		logInfo("Waiting for at least one peer connection before starting consensus...")
+		for {
+			select {
+			case <-cs.stopCh:
+				return
+			default:
+			}
+			cs.mu.Lock()
+			ready := len(cs.peers) > 0
+			cs.mu.Unlock()
+			if ready {
+				break
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+		cs.mu.Lock()
+		leader1 = cs.leaderForView(cs.currentView)
+		logSys("Cluster : %v", cs.peerOrder)
+		logSys("Total   : %d nodes  |  quorum=%d  f=%d",
+			cs.totalNodes(), cs.quorum(), cs.faultTolerance())
+		cs.mu.Unlock()
+		logSys("Leader for View %d : Node %d", cs.currentView, leader1)
+	}
+
 	cs.mu.Lock()
 	amLeader := cs.isLeaderThisView()
 	cs.mu.Unlock()

@@ -186,6 +186,9 @@ func (cs *ConsensusState) discoverPeers() {
 	peerIDs := make([]int, 0, len(cs.nodeAddrs))
 	for id := range cs.nodeAddrs {
 		if id != cs.NodeID {
+			if _, joined := cs.peers[id]; joined {
+				continue
+			}
 			peerIDs = append(peerIDs, id)
 		}
 	}
