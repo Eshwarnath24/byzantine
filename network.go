@@ -15,7 +15,7 @@ const (
 )
 
 func (cs *ConsensusState) startListener() error {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", cs.Port))
+	listener, err := net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%d", cs.Port))
 	if err != nil {
 		return err
 	}
@@ -79,7 +79,7 @@ func (cs *ConsensusState) sendTo(peerID int, msg Message) {
 	if addr == "" {
 		return
 	}
-	conn, err := (&net.Dialer{Timeout: tcpDialTimeout}).Dial("tcp", addr)
+	conn, err := (&net.Dialer{Timeout: tcpDialTimeout}).Dial("tcp4", addr)
 	if err != nil {
 		cs.incrementFailureCount(peerID)
 		return
