@@ -416,29 +416,23 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			logSys("Cluster: %v  total=%d  quorum=%d  f=%d",
 				cs.peerOrder, cs.totalNodes(), cs.quorum(), cs.faultTolerance())
 
-			// Restart consensus with updated cluster membership
 			wasInRound := cs.inRound
+			wasLeader := cs.isLeaderThisView()
 			newLeader := cs.leaderForView(cs.currentView)
-			cs.inRound = false
-			cs.pendingBlock = nil
-			cs.proposalForView = nil
-			cs.stopViewTimer()
-			cs.stopVotePhaseTimer()
+			amStillLeader := (newLeader == cs.NodeID)
+
 			cs.mu.Unlock()
 			fmt.Printf("%s%s%s\n", cGreen, bar(52), cReset)
 
-			// Restart the round with correct leadership
 			if wasInRound {
-				logWarn("Restarting View %d with new cluster membership", cs.currentView)
-				if newLeader == cs.NodeID {
+				logWarn("Cluster membership changed - View %d continues", cs.currentView)
+				if wasLeader && amStillLeader {
+					logLead("You remain the leader - continue when ready")
+				} else if !amStillLeader {
+					logInfo("Node %d is now the leader", newLeader)
+				} else {
 					logLead(">>> YOU are now the leader for View %d", cs.currentView)
 					go cs.runLeaderRound()
-				} else {
-					logInfo("Node %d is the leader for View %d", newLeader, cs.currentView)
-					cs.mu.Lock()
-					cs.inRound = true
-					cs.startViewTimer()
-					cs.mu.Unlock()
 				}
 			}
 		}
@@ -495,7 +489,6 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			cs.joinOrder = newOrder
 			cs.rebuildOrder()
 		}
-		// Adopt sender's view and highest QC block so late-joining nodes sync up.
 		if msg.View > cs.currentView {
 			cs.currentView = msg.View
 		}
@@ -503,13 +496,12 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			cs.highestQCBlock = msg.HighestQCBlock
 		}
 
-		// Restart consensus if we were in a round but cluster changed
 		wasInRound := cs.inRound
+		wasLeader := cs.isLeaderThisView()
 		newLeader := cs.leaderForView(cs.currentView)
-		amLeader := (newLeader == cs.NodeID)
+		amStillLeader := (newLeader == cs.NodeID)
 
-		if wasInRound && !amLeader {
-			// We were leader but now we're not - stop and become replica
+		if wasInRound && wasLeader && !amStillLeader {
 			cs.inRound = false
 			cs.pendingBlock = nil
 			cs.proposalForView = nil
@@ -524,17 +516,6 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			cs.inRound = true
 			cs.startViewTimer()
 			cs.mu.Unlock()
-		} else if wasInRound && amLeader {
-			// We're still the leader but cluster changed - restart round
-			cs.inRound = false
-			cs.pendingBlock = nil
-			cs.proposalForView = nil
-			cs.stopViewTimer()
-			cs.stopVotePhaseTimer()
-			cs.mu.Unlock()
-
-			logWarn("Cluster updated - restarting round as leader")
-			go cs.runLeaderRound()
 		} else {
 			cs.mu.Unlock()
 		}
