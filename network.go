@@ -53,7 +53,9 @@ func (cs *ConsensusState) handleConnection(conn net.Conn) {
 		cs.mu.Lock()
 		cs.sendFailures[msg.SenderID] = 0
 		cs.mu.Unlock()
-		logNet("Registered incoming connection from Node %d (%s)", msg.SenderID, conn.RemoteAddr())
+		if msg.Type != "PING" {
+			logNet("Registered incoming connection from Node %d (%s)", msg.SenderID, conn.RemoteAddr())
+		}
 	}
 	cs.handleMessage(msg)
 }

@@ -341,6 +341,10 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		copy(orderSnap, cs.peerOrder)
 		view := cs.currentView
 		hqcBlock := cs.highestQCBlock
+		addrsCopy := make(map[int]string, len(cs.nodeAddrs))
+		for id, ip := range cs.nodeAddrs {
+			addrsCopy[id] = ip
+		}
 		cs.mu.Unlock()
 		if isNew {
 			fmt.Printf("\n%s%s%s\n", cGreen+cBold, bar(52), cReset)
@@ -352,10 +356,6 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			fmt.Printf("%s%s%s\n", cGreen, bar(52), cReset)
 		}
 
-		addrsCopy := make(map[int]string, len(cs.nodeAddrs))
-		for id, ip := range cs.nodeAddrs {
-			addrsCopy[id] = ip
-		}
 		go cs.sendTo(msg.SenderID, Message{
 			Type:           "HELLO_ACK",
 			SenderID:       cs.NodeID,
@@ -512,7 +512,6 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		total := cs.totalNodes()
 
 		if msg.Vote.NoVote {
-
 			if _, already := cs.noVotesForView[voterID]; already {
 				cs.mu.Unlock()
 				return
@@ -522,16 +521,28 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			cs.mu.Unlock()
 			logVote("NO vote from Node %d  |  NO: %d  (abort threshold: >%d)", voterID, noCount, total/2)
 
-			if _, already := cs.votesForView[voterID]; already {
-				cs.mu.Unlock()
-				return
+			if noCount > total/2 {
+				cs.abortRound()
 			}
-			cs.votesForView[voterID] = true
-			yesVotes := len(cs.votesForView) + 1
-			needed := cs.quorum()
-			cs.mu.Unlock()
-			logVote("YES vote from Node %d  |  YES: %d/%d", voterID, yesVotes, needed)
+			return
+		}
 
+		if _, already := cs.votesForView[voterID]; already {
+			cs.mu.Unlock()
+			return
+		}
+		cs.votesForView[voterID] = true
+		yesVotes := len(cs.votesForView) + 1
+		needed := cs.quorum()
+		cs.mu.Unlock()
+		logVote("YES vote from Node %d  |  YES: %d/%d", voterID, yesVotes, needed)
+
+		if yesVotes >= needed {
+			cs.formAndBroadcastQC()
+		}
+
+	case "QC":
+		if msg.QC == nil {
 			return
 		}
 		cs.mu.Lock()
