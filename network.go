@@ -309,3 +309,130 @@ func (cs *ConsensusState) tryConnectConfigPeers() {
 		go cs.sendTo(id, Message{Type: "HELLO", SenderID: cs.NodeID})
 	}
 }
+
+// ─── UDP MULTICAST BEACON (Auto-Discovery on LAN) ──────────────────────────
+
+const (
+	multicastGroup = "224.0.0.100:8888"
+	beaconInterval = 2 * time.Second
+)
+
+// UDPBeacon is a lightweight peer discovery message sent via multicast.
+type UDPBeacon struct {
+	NodeID  int   `json:"node_id"`
+	TCPPort int   `json:"tcp_port"`
+	WebPort int   `json:"web_port"`
+	Time    int64 `json:"timestamp"`
+}
+
+// startUDPBeacon spawns a goroutine that broadcasts this node's beacon every 2s.
+// This allows nodes on the same LAN to auto-discover without config.json or IPs.
+func (cs *ConsensusState) startUDPBeacon() {
+	go func() {
+		addr, err := net.ResolveUDPAddr("udp", multicastGroup)
+		if err != nil {
+			logNet("UDP beacon disabled (ResolveUDPAddr: %v)", err)
+			return
+		}
+
+		conn, err := net.DialUDP("udp", nil, addr)
+		if err != nil {
+			logNet("UDP beacon disabled (DialUDP: %v)", err)
+			return
+		}
+		defer conn.Close()
+
+		logNet("UDP beacon enabled → broadcasting on %s", multicastGroup)
+
+		ticker := time.NewTicker(beaconInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-cs.stopCh:
+				return
+			case <-ticker.C:
+				beacon := UDPBeacon{
+					NodeID:  cs.NodeID,
+					TCPPort: cs.Port,
+					WebPort: 8000 + cs.NodeID,
+					Time:    time.Now().Unix(),
+				}
+				data, _ := json.Marshal(beacon)
+				conn.Write(data)
+			}
+		}
+	}()
+}
+
+// listenUDPBeacon spawns a goroutine that listens for multicast beacons.
+// When beacons arrive, it auto-discovers peer addresses and initiates TCP HELLO.
+func (cs *ConsensusState) listenUDPBeacon() {
+	go func() {
+		addr, err := net.ResolveUDPAddr("udp", multicastGroup)
+		if err != nil {
+			logNet("UDP listen disabled (ResolveUDPAddr: %v)", err)
+			return
+		}
+
+		conn, err := net.ListenMulticastUDP("udp", nil, addr)
+		if err != nil {
+			logNet("UDP listen disabled (ListenMulticastUDP: %v)", err)
+			return
+		}
+		defer conn.Close()
+
+		logNet("UDP beacon listener active on %s", multicastGroup)
+
+		buffer := make([]byte, 512)
+		for {
+			select {
+			case <-cs.stopCh:
+				return
+			default:
+				conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+				n, remoteAddr, err := conn.ReadFromUDP(buffer)
+				if err != nil {
+					continue
+				}
+
+				var beacon UDPBeacon
+				if err := json.Unmarshal(buffer[:n], &beacon); err != nil {
+					continue
+				}
+
+				if beacon.NodeID == cs.NodeID {
+					continue // ignore self
+				}
+
+				senderIP := remoteAddr.IP.String()
+				cs.handleUDPBeacon(beacon, senderIP)
+			}
+		}
+	}()
+}
+
+// handleUDPBeacon processes a received UDP beacon and adds the sender as a peer.
+func (cs *ConsensusState) handleUDPBeacon(beacon UDPBeacon, senderIP string) {
+	cs.mu.Lock()
+	_, alreadyKnown := cs.peers[beacon.NodeID]
+	_, hasAddr := cs.nodeAddrs[beacon.NodeID]
+	cs.mu.Unlock()
+
+	if !alreadyKnown && !hasAddr {
+		// Learn new peer's IP from beacon
+		cs.mu.Lock()
+		cs.nodeAddrs[beacon.NodeID] = senderIP
+		cs.mu.Unlock()
+		logNet("UDP beacon: learned Node %d at %s", beacon.NodeID, senderIP)
+	}
+
+	// Try to send HELLO to this node
+	cs.mu.Lock()
+	_, alreadyPeer := cs.peers[beacon.NodeID]
+	cs.mu.Unlock()
+
+	if !alreadyPeer {
+		go cs.sendTo(beacon.NodeID, Message{Type: "HELLO", SenderID: cs.NodeID})
+	}
+}

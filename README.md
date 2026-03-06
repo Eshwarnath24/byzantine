@@ -76,52 +76,58 @@ go run . 4 -m
 
 ---
 
-### Option B — 2 Laptops (2 nodes each)
+### Option B — 2 Laptops (Automatic UDP Discovery, Recommended)
 
-First find each laptop's IP:
+**No firewall config, no manual IPs needed!**
+
+Each node broadcasts "I'm here" via UDP multicast (`224.0.0.100:8888`), and peers auto-discover on the same LAN.
+
+**Laptop A** — 2 terminals (any node IDs you want):
+```
+./hotstuff.exe 1
+./hotstuff.exe 2
+```
+
+**Laptop B** — 2 terminals (different node IDs):
+```
+./hotstuff.exe 3
+./hotstuff.exe 4
+```
+
+Nodes will automatically find each other **within 2–5 seconds**. Check logs for:
+```
+UDP beacon: learned Node X at [other_laptop_IP]
+Node X joined the network
+```
+
+---
+
+### Option B-Advanced — 2 Laptops (Manual IP, if UDP fails)
+
+If UDP multicast is blocked on your network, use explicit IPs.
+
+Find each laptop's IPv4:
 ```
 ipconfig
 ```
-Look for **IPv4 Address** under Wi-Fi or Ethernet.
 
-**Open firewall on both laptops (run as Administrator):**
+**Open firewall (both laptops, Admin PowerShell):**
 ```
 netsh advfirewall firewall add rule name="HotStuff-Consensus" dir=in action=allow protocol=TCP localport=7001-7004
 netsh advfirewall firewall add rule name="HotStuff-Web" dir=in action=allow protocol=TCP localport=8001-8004
 ```
 
-**Your Laptop** (e.g. `10.12.76.144`) — 2 terminals:
+**Laptop A** (e.g. `10.12.76.144`) — 2 terminals:
 ```
-go run . 1 3=<friend_IP> 4=<friend_IP>
-go run . 2 3=<friend_IP> 4=<friend_IP>
-```
-
-**Friend's Laptop** (e.g. `10.12.77.238`) — 2 terminals:
-```
-go run . 3 1=<your_IP> 2=<your_IP>
-go run . 4 1=<your_IP> 2=<your_IP> -m
+./hotstuff.exe 1 3=10.12.77.238 4=10.12.77.238
+./hotstuff.exe 2 3=10.12.77.238 4=10.12.77.238
 ```
 
-**Alternative (same `config.json` on both laptops):**
-
-1. Keep one shared `config.json` mapping all node IDs to laptop IPs.
-2. Start nodes with only node IDs (no extra `id=IP` args):
+**Laptop B** (e.g. `10.12.77.238`) — 2 terminals:
 ```
-# Laptop A
-./hotstuff.exe 1
-./hotstuff.exe 2
-
-# Laptop B
-./hotstuff.exe 3
-./hotstuff.exe 4
+./hotstuff.exe 3 1=10.12.76.144 2=10.12.76.144
+./hotstuff.exe 4 1=10.12.76.144 2=10.12.76.144 -m
 ```
-3. If running one node per laptop and each laptop IP maps to exactly one node in `config.json`, you can start with auto-detection:
-```
-./hotstuff.exe
-```
-
-> Node IDs on the same laptop discover each other via localhost automatically.  
-> Only nodes on the other machine need an explicit `id=IP` argument.
 
 ---
 
@@ -268,12 +274,13 @@ Result: 3 YES votes ≥ quorum(3) → QC formed → block accepted
 | Problem | Cause | Fix |
 |---------|-------|-----|
 | `Cannot listen on port XXXX` | Node already running | Kill the old process or use a different node ID |
-| `No peers found` | Other nodes not started yet | Start all nodes within ~5 seconds of each other |
+| `No peers found` | Other nodes not started yet | Start all nodes within ~5 seconds; UDP beacons broadcast every 2 seconds |
+| Nodes not discovering each other (different laptops) | UDP multicast blocked | Use Option B-Advanced (manual `id=IP` args) instead |
 | Node 2 not getting Y/N prompt | Peer not discovered | Ensure both nodes on same machine started; they auto-discover via localhost |
 | `View timeout` / `WARN VIEW TIMER` | Leader silent or crashed | Automatic — view change triggers new leader |
-| Replica keeps timing out | Network blocked | Open firewall ports 7001–7004 (consensus) and 8001–8004 (web/rpc) on both machines |
+| Replica keeps timing out (cross-laptop) | Network blocked | Try Option B (UDP auto-discovery) first; if it fails, use B-Advanced with firewall rules |
 | QC never forms | Not enough YES votes | Need `2f+1` YES votes; with 4 nodes quorum = 3 |
-| Dashboard not loading | Web server port blocked | Open firewall ports 7001–7004; check `Web dashboard →` line in startup output |
+| Dashboard not loading | Web server port blocked | (Option B-Adv) Open firewall ports 8001–8004; check `Web dashboard →` line in startup output |
 | Browser prompt not appearing | SSE connection dropped | Refresh the page; the `/events` endpoint reconnects automatically |
 
 ---
