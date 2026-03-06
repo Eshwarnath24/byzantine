@@ -190,21 +190,32 @@ func (cs *ConsensusState) broadcast(msg Message) {
 func (cs *ConsensusState) discoverPeers() {
 	cs.mu.Lock()
 	multiMachine := len(cs.nodeAddrs) > 0
+	configuredNodes := make(map[int]bool)
+	for id := range cs.nodeAddrs {
+		configuredNodes[id] = true
+	}
 	cs.mu.Unlock()
 
 	if multiMachine {
-		logSys("Multi-machine mode — scanning all ports (configured IPs + localhost co-nodes)...")
+		logSys("Multi-machine mode — scanning configured nodes only...")
 	} else {
-		logSys("Scanning for peers on ports 8001–8009...")
+		logSys("Scanning for peers on ports 7001–7009...")
 	}
 
-	// Always scan all IDs 1–9. peerAddr() uses the configured IP for
-	// explicitly listed peers and falls back to localhost for the rest,
-	// so co-located nodes on the same machine are always discovered.
+	// In multi-machine mode, only scan configured nodes.
+	// In single-machine mode, scan all IDs 1–9 on localhost.
 	candidates := make([]int, 0, 9)
 	for id := 1; id <= 9; id++ {
 		if id != cs.NodeID {
-			candidates = append(candidates, id)
+			if multiMachine {
+				// Only add nodes that are in config
+				if configuredNodes[id] {
+					candidates = append(candidates, id)
+				}
+			} else {
+				// Single-machine: scan all
+				candidates = append(candidates, id)
+			}
 		}
 	}
 
@@ -223,9 +234,9 @@ func (cs *ConsensusState) discoverPeers() {
 		found++
 	}
 	if found == 0 {
-		logSys("No new peers found.")
+		logSys("No new peers to scan.")
 	} else {
-		logSys("Discovered %d new peers.", found)
+		logSys("Scanning %d configured peer(s).", found)
 		time.Sleep(1000 * time.Millisecond)
 	}
 }
