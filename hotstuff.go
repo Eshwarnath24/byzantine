@@ -1319,6 +1319,50 @@ func (cs *ConsensusState) peerHealthCheck() {
 	}
 }
 
+// ─── TWO-LAPTOP AUTO-DETECT ─────────────────────────────────────────────────────
+
+// autoPopulateForTwoLaptops auto-detects and populates nodeAddrs for two-laptop setup.
+// All nodes in config with the same IP as myNodeID are on "my" laptop.
+// All nodes with a different IP are on "friend's" laptop.
+func autoPopulateForTwoLaptops(nodeID int, peerIPs map[int]string) {
+	myIP := ""
+	uniqueIPs := make(map[string]bool)
+
+	for id, ip := range peerIPs {
+		if ip == "" {
+			continue
+		}
+		uniqueIPs[ip] = true
+		if id == nodeID {
+			myIP = ip
+		}
+	}
+
+	if myIP == "" || len(uniqueIPs) < 2 {
+		return // not a two-laptop setup
+	}
+
+	var friendIP string
+	for ip := range uniqueIPs {
+		if ip != myIP {
+			friendIP = ip
+			break
+		}
+	}
+
+	if friendIP == "" {
+		return
+	}
+
+	for id, ip := range peerIPs {
+		if id != nodeID && ip == friendIP {
+			peerIPs[id] = friendIP
+		}
+	}
+
+	logNet("Auto-detected two-laptop: my=%s, friend=%s", myIP, friendIP)
+}
+
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -1350,6 +1394,12 @@ func main() {
 	if peerIPs == nil {
 		peerIPs = make(map[int]string)
 	}
+
+	// Auto-detect two-laptop setup from config.json and populate nodeAddrs
+	if len(peerIPs) > 0 {
+		autoPopulateForTwoLaptops(nodeID, peerIPs)
+	}
+
 	// Command-line args override config.json
 	for _, a := range os.Args[2:] {
 		if a == "-m" {
