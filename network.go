@@ -186,7 +186,7 @@ func (cs *ConsensusState) broadcast(msg Message) {
 // IDs are contacted, using their actual IP addresses.
 //
 // Same-machine mode   (no id=IP args):             scans localhost ports
-// 8001–8009 as before, so existing single-machine usage is unchanged.
+// 7001–7009 as before, so existing single-machine usage is unchanged.
 func (cs *ConsensusState) discoverPeers() {
 	cs.mu.Lock()
 	multiMachine := len(cs.nodeAddrs) > 0

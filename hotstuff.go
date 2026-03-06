@@ -343,6 +343,24 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 // IMPORTANT: When using joinOrder, we respect FIRST-COME-FIRST-SERVED (arrival) order,
 // NOT ID-sorted order. This ensures leader rotation follows actual join sequence.
 func (cs *ConsensusState) rebuildOrder() {
+	if len(cs.nodeAddrs) > 0 {
+		// Multi-laptop mode: use fixed membership so quorum does not collapse
+		// to a single node when a peer is temporarily unreachable.
+		members := map[int]bool{cs.NodeID: true}
+		for id := range cs.nodeAddrs {
+			if id >= 1 && id <= 9 {
+				members[id] = true
+			}
+		}
+		order := make([]int, 0, len(members))
+		for id := range members {
+			order = append(order, id)
+		}
+		sort.Ints(order)
+		cs.peerOrder = order
+		return
+	}
+
 	order := make([]int, 0, len(cs.joinOrder))
 	// Both multi-machine and same-machine modes: only include nodes that have ACTUALLY joined
 	// joinOrder tracks the arrival sequence, so we respect it exactly
@@ -1344,6 +1362,7 @@ func main() {
 	if peerIPs == nil {
 		peerIPs = make(map[int]string)
 	}
+	cliPeerOverrides := false
 
 	// Auto-detect two-laptop setup from config.json and populate nodeAddrs
 	if len(peerIPs) > 0 {
@@ -1361,6 +1380,12 @@ func main() {
 		if len(parts) == 2 {
 			pid, perr := strconv.Atoi(parts[0])
 			if perr == nil && pid >= 1 && pid <= 9 && pid != nodeID {
+				if !cliPeerOverrides {
+					// If explicit id=IP args are provided, use them as the source
+					// of truth instead of mixing with config.json peers.
+					peerIPs = make(map[int]string)
+					cliPeerOverrides = true
+				}
 				// Strip optional port from the IP portion.
 				host := parts[1]
 				if h, _, splitErr := net.SplitHostPort(host); splitErr == nil {
