@@ -415,8 +415,32 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			cs.mu.Lock()
 			logSys("Cluster: %v  total=%d  quorum=%d  f=%d",
 				cs.peerOrder, cs.totalNodes(), cs.quorum(), cs.faultTolerance())
+
+			// Restart consensus with updated cluster membership
+			wasInRound := cs.inRound
+			newLeader := cs.leaderForView(cs.currentView)
+			cs.inRound = false
+			cs.pendingBlock = nil
+			cs.proposalForView = nil
+			cs.stopViewTimer()
+			cs.stopVotePhaseTimer()
 			cs.mu.Unlock()
 			fmt.Printf("%s%s%s\n", cGreen, bar(52), cReset)
+
+			// Restart the round with correct leadership
+			if wasInRound {
+				logWarn("Restarting View %d with new cluster membership", cs.currentView)
+				if newLeader == cs.NodeID {
+					logLead(">>> YOU are now the leader for View %d", cs.currentView)
+					go cs.runLeaderRound()
+				} else {
+					logInfo("Node %d is the leader for View %d", newLeader, cs.currentView)
+					cs.mu.Lock()
+					cs.inRound = true
+					cs.startViewTimer()
+					cs.mu.Unlock()
+				}
+			}
 		}
 		// Copy nodeAddrs for exchange
 		addrsCopy := make(map[int]string, len(cs.nodeAddrs))
@@ -478,7 +502,42 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		if msg.HighestQCBlock > cs.highestQCBlock {
 			cs.highestQCBlock = msg.HighestQCBlock
 		}
-		cs.mu.Unlock()
+
+		// Restart consensus if we were in a round but cluster changed
+		wasInRound := cs.inRound
+		newLeader := cs.leaderForView(cs.currentView)
+		amLeader := (newLeader == cs.NodeID)
+
+		if wasInRound && !amLeader {
+			// We were leader but now we're not - stop and become replica
+			cs.inRound = false
+			cs.pendingBlock = nil
+			cs.proposalForView = nil
+			cs.stopViewTimer()
+			cs.stopVotePhaseTimer()
+			cs.mu.Unlock()
+
+			logWarn("Cluster updated - Node %d is now the leader for View %d", newLeader, cs.currentView)
+			logInfo("You are now a replica. Waiting for proposal...")
+
+			cs.mu.Lock()
+			cs.inRound = true
+			cs.startViewTimer()
+			cs.mu.Unlock()
+		} else if wasInRound && amLeader {
+			// We're still the leader but cluster changed - restart round
+			cs.inRound = false
+			cs.pendingBlock = nil
+			cs.proposalForView = nil
+			cs.stopViewTimer()
+			cs.stopVotePhaseTimer()
+			cs.mu.Unlock()
+
+			logWarn("Cluster updated - restarting round as leader")
+			go cs.runLeaderRound()
+		} else {
+			cs.mu.Unlock()
+		}
 
 	case "PROPOSE":
 		if msg.Block == nil {
