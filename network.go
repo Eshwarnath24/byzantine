@@ -16,11 +16,9 @@ package main
 // =============================================================================
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
 	"time"
 )
 
@@ -40,11 +38,6 @@ func (cs *ConsensusState) peerHost(id int) string {
 		return host
 	}
 	return "localhost"
-}
-
-// peerRPCURL is the HTTP fallback endpoint for consensus message delivery.
-func (cs *ConsensusState) peerRPCURL(id int) string {
-	return fmt.Sprintf("http://%s:%d/rpc", cs.peerHost(id), 8000+id)
 }
 
 // ─── LISTENER ────────────────────────────────────────────────────────────────
@@ -93,23 +86,11 @@ func (cs *ConsensusState) sendTo(nodeID int, msg Message) {
 	addr := cs.peerAddr(nodeID)
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
-		if cs.sendToHTTPFallback(nodeID, msg) {
-			cs.mu.Lock()
-			cs.sendFailures[nodeID] = 0
-			cs.mu.Unlock()
-			return
-		}
 		cs.recordSendFailure(nodeID)
 		return
 	}
 	defer conn.Close()
 	if encErr := json.NewEncoder(conn).Encode(msg); encErr != nil {
-		if cs.sendToHTTPFallback(nodeID, msg) {
-			cs.mu.Lock()
-			cs.sendFailures[nodeID] = 0
-			cs.mu.Unlock()
-			return
-		}
 		cs.recordSendFailure(nodeID)
 		return
 	}
@@ -117,27 +98,6 @@ func (cs *ConsensusState) sendTo(nodeID int, msg Message) {
 	cs.mu.Lock()
 	cs.sendFailures[nodeID] = 0
 	cs.mu.Unlock()
-}
-
-// sendToHTTPFallback tries to deliver consensus messages via HTTP /rpc on the
-// web server port. This helps cross-laptop setups when direct TCP is blocked.
-func (cs *ConsensusState) sendToHTTPFallback(nodeID int, msg Message) bool {
-	body, err := json.Marshal(msg)
-	if err != nil {
-		return false
-	}
-	client := &http.Client{Timeout: 5000 * time.Millisecond}
-	resp, err := client.Post(cs.peerRPCURL(nodeID), "application/json", bytes.NewReader(body))
-	if err != nil {
-		logNet("HTTP fallback to Node %d failed: %v", nodeID, err)
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		logNet("HTTP fallback to Node %d succeeded", nodeID)
-		return true
-	}
-	return false
 }
 
 // recordSendFailure increments the per-peer failure counter and triggers
@@ -171,8 +131,6 @@ func (cs *ConsensusState) removePeer(nodeID int, restartRound bool) {
 	logSys("Cluster: %v  total=%d  quorum=%d  f=%d",
 		cs.peerOrder, cs.totalNodes(), cs.quorum(), cs.faultTolerance())
 	fmt.Printf("%s%s%s\n", cYellow, bar(52), cReset)
-	cs.emitStateLocked()
-	cs.emitWeb("log", map[string]interface{}{"level": "warn", "message": fmt.Sprintf("Node %d removed from cluster", nodeID)})
 
 	if !restartRound || (!wasLeader && !cs.inRound) {
 		cs.mu.Unlock()
@@ -326,7 +284,6 @@ const (
 type UDPBeacon struct {
 	NodeID  int   `json:"node_id"`
 	TCPPort int   `json:"tcp_port"`
-	WebPort int   `json:"web_port"`
 	Time    int64 `json:"timestamp"`
 }
 
@@ -360,7 +317,6 @@ func (cs *ConsensusState) startUDPBeacon() {
 				beacon := UDPBeacon{
 					NodeID:  cs.NodeID,
 					TCPPort: cs.Port,
-					WebPort: 8000 + cs.NodeID,
 					Time:    time.Now().Unix(),
 				}
 				data, _ := json.Marshal(beacon)

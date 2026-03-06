@@ -37,7 +37,7 @@
 //    Laptop 3:  go run hotstuff.go network.go 3 1=192.168.1.1 2=192.168.1.2 4=192.168.1.4
 //    Laptop 4:  go run hotstuff.go network.go 4 1=192.168.1.1 2=192.168.1.2 3=192.168.1.3
 //
-//  Node IDs: 1–9   Port = 8000 + nodeID
+//  Node IDs: 1–9   Port = 7000 + nodeID
 //  Type 'exit' at any prompt to leave gracefully.
 // =============================================================================
 
@@ -224,7 +224,6 @@ type ConsensusState struct {
 	listener   net.Listener
 	stopCh     chan struct{}
 	inputLines chan string
-	webHub     *WebHub // web dashboard event hub
 }
 
 // ─── TIMER HELPERS ────────────────────────────────────────────────────────────
@@ -249,9 +248,6 @@ func (cs *ConsensusState) startViewTimer() {
 		logWarn("VIEW TIMER: leader silent — triggering VIEW CHANGE to view %d", newView)
 		logSys("New leader: Node %d", newLeader)
 		fmt.Printf("%s%s%s\n", cYellow, bar(52), cReset)
-		cs.emitWeb("hide_prompt", nil)
-		cs.emitState()
-		cs.emitWeb("log", map[string]interface{}{"level": "warn", "message": fmt.Sprintf("View timeout → view %d (leader: Node %d)", newView, newLeader)})
 		cs.broadcast(Message{Type: "NEW_VIEW", SenderID: cs.NodeID, View: newView})
 		if newLeader == cs.NodeID {
 			go cs.runLeaderRound()
@@ -293,9 +289,6 @@ func (cs *ConsensusState) startVotePhaseTimer() {
 		logWarn("VOTE-PHASE TIMEOUT — quorum not reached in %s — forcing VIEW CHANGE", votePhaseTimeout)
 		logSys("New view: %d  |  New leader: Node %d", newView, newLeader)
 		fmt.Printf("%s%s%s\n", cYellow, bar(52), cReset)
-		cs.emitWeb("hide_prompt", nil)
-		cs.emitState()
-		cs.emitWeb("log", map[string]interface{}{"level": "warn", "message": fmt.Sprintf("Vote-phase timeout → view %d", newView)})
 		cs.broadcast(Message{Type: "NEW_VIEW", SenderID: cs.NodeID, View: newView})
 		if newLeader == cs.NodeID {
 			go cs.runLeaderRound()
@@ -338,7 +331,6 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 		noVotesForView: make(map[int]bool),
 		stopCh:         make(chan struct{}),
 		inputLines:     make(chan string, 64),
-		webHub:         newWebHub(),
 	}
 }
 
@@ -437,8 +429,6 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 				cs.peerOrder, cs.totalNodes(), cs.quorum(), cs.faultTolerance())
 			cs.mu.Unlock()
 			fmt.Printf("%s%s%s\n", cGreen, bar(52), cReset)
-			cs.emitState()
-			cs.emitWeb("log", map[string]interface{}{"level": "net", "message": fmt.Sprintf("Node %d joined the cluster", msg.SenderID)})
 		}
 		// Copy nodeAddrs for exchange
 		addrsCopy := make(map[int]string, len(cs.nodeAddrs))
@@ -539,8 +529,6 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 				blk.ID, msg.SenderID, computeChecksum(blk.Data), blk.Checksum)
 			logWarn("AUTO-REJECTING proposal (Byzantine node detected)")
 			fmt.Printf("%s%s%s\n", cRed, bar(52), cReset)
-			cs.emitWeb("log", map[string]interface{}{"level": "err", "message": fmt.Sprintf("CHECKSUM FAIL — Block %d from Node %d auto-rejected (Byzantine)", blk.ID, msg.SenderID)})
-			cs.emitState()
 			go cs.sendTo(msg.SenderID, Message{
 				Type:     "VOTE",
 				SenderID: cs.NodeID,
@@ -610,31 +598,18 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			noCount := len(cs.noVotesForView)
 			cs.mu.Unlock()
 			logVote("NO vote from Node %d  |  NO: %d  (abort threshold: >%d)", voterID, noCount, total/2)
-			cs.emitWeb("log", map[string]interface{}{"level": "vote", "message": fmt.Sprintf("NO vote from Node %d (%d NO)", voterID, noCount)})
-			if noCount > total/2 {
-				logWarn("Strict majority rejected — aborting round")
-				cs.abortRound()
+
+			// YES vote.
+			if _, already := cs.votesForView[voterID]; already {
+				cs.mu.Unlock()
+				return
 			}
-			return
-		}
-
-		// YES vote.
-		if _, already := cs.votesForView[voterID]; already {
+			cs.votesForView[voterID] = true
+			yesVotes := len(cs.votesForView) + 1 // +1 for leader implicit vote
+			needed := cs.quorum()
 			cs.mu.Unlock()
-			return
-		}
-		cs.votesForView[voterID] = true
-		yesVotes := len(cs.votesForView) + 1 // +1 for leader implicit vote
-		needed := cs.quorum()
-		cs.mu.Unlock()
-		logVote("YES vote from Node %d  |  YES: %d/%d", voterID, yesVotes, needed)
-		cs.emitWeb("log", map[string]interface{}{"level": "vote", "message": fmt.Sprintf("YES vote from Node %d (%d/%d)", voterID, yesVotes, needed)})
-		if yesVotes >= needed {
-			cs.formAndBroadcastQC()
-		}
+			logVote("YES vote from Node %d  |  YES: %d/%d", voterID, yesVotes, needed)
 
-	case "QC":
-		if msg.QC == nil {
 			return
 		}
 		cs.mu.Lock()
@@ -668,13 +643,10 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		cs.stopViewTimer()
 		cs.stopVotePhaseTimer()
 		cs.mu.Unlock()
-		cs.emitWeb("hide_prompt", nil)
 		if !alreadyHave {
 			cs.checkAndCommit()
 			printQC(msg.QC)
 			cs.printBlockchainState()
-			cs.emitState()
-			cs.emitWeb("log", map[string]interface{}{"level": "qc", "message": fmt.Sprintf("QC received for Block %d (View %d)", msg.QC.BlockID, msg.QC.View)})
 			cs.mu.Lock()
 			nextView := cs.currentView
 			nextLeader := cs.leaderForView(nextView)
@@ -723,9 +695,6 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			cs.mu.Unlock()
 			logWarn("NEW_VIEW from Node %d → view %d  |  leader: Node %d",
 				msg.SenderID, msg.View, leader)
-			cs.emitWeb("hide_prompt", nil)
-			cs.emitState()
-			cs.emitWeb("log", map[string]interface{}{"level": "warn", "message": fmt.Sprintf("View change → %d (leader: Node %d)", msg.View, leader)})
 			if leader == cs.NodeID {
 				go cs.runLeaderRound()
 			} else {
@@ -767,15 +736,6 @@ func (cs *ConsensusState) printProposalAndPrompt(blk *Block, leaderID, view int)
 	fmt.Printf("  %-20s %s\n", "Checksum:", checksumStatus)
 	fmt.Printf("%s%s%s\n", cCyan, bar(52), cReset)
 	fmt.Printf("\n%sChecksum OK — Accept proposal from leader? (y/n): %s", cGreen+cBold, cReset)
-	cs.emitWeb("prompt_vote", map[string]interface{}{
-		"blockId":    blk.ID,
-		"parentId":   blk.ParentID,
-		"data":       blk.Data,
-		"view":       view,
-		"leaderId":   leaderID,
-		"checksum":   blk.Checksum,
-		"checksumOk": blk.Checksum == "" || blk.Checksum == expected,
-	})
 }
 
 // ─── LEADER ROUND ─────────────────────────────────────────────────────────────
@@ -814,7 +774,6 @@ func (cs *ConsensusState) runLeaderRound() {
 	// Notify replicas that we are alive and preparing — resets their viewTimer.
 	cs.broadcast(Message{Type: "PREPARE", SenderID: cs.NodeID, View: view})
 
-	cs.emitWeb("prompt_data", map[string]interface{}{"view": view})
 	fmt.Printf("%s  Enter block data: %s", cYellow+cBold, cReset)
 	data := cs.readLine()
 	if data == "" {
@@ -827,7 +786,6 @@ func (cs *ConsensusState) runLeaderRound() {
 	if cs.currentView != view || !cs.isLeaderThisView() {
 		cs.mu.Unlock()
 		logWarn("View changed while waiting for input — aborting proposal")
-		cs.emitWeb("hide_prompt", nil)
 		return
 	}
 	parentID := cs.highestQCBlock // always extend the highest QC'd block
@@ -872,7 +830,6 @@ func (cs *ConsensusState) formAndBroadcastQC() {
 		cs.mu.Unlock()
 		return
 	}
-	cs.emitWeb("hide_prompt", nil)
 	blk := cs.pendingBlock
 	voters := []int{} // explicit YES voters (leader self-vote tracked separately)
 	for id := range cs.votesForView {
@@ -906,8 +863,6 @@ func (cs *ConsensusState) formAndBroadcastQC() {
 	cs.checkAndCommit()
 	printQC(qc)
 	cs.printBlockchainState()
-	cs.emitState()
-	cs.emitWeb("log", map[string]interface{}{"level": "qc", "message": fmt.Sprintf("QC formed for Block %d (View %d, %d votes)", qc.BlockID, qc.View, qc.VoteCount)})
 	cs.broadcast(Message{Type: "QC", SenderID: cs.NodeID, View: qc.View, Block: blk, QC: qc})
 
 	fmt.Printf("\n%s%s%s\n", cCyan, bar(52), cReset)
@@ -932,7 +887,6 @@ func (cs *ConsensusState) abortRound() {
 		cs.mu.Unlock()
 		return
 	}
-	cs.emitWeb("hide_prompt", nil)
 	view := cs.currentView
 	cs.currentView++
 	cs.inRound = false
@@ -952,8 +906,6 @@ func (cs *ConsensusState) abortRound() {
 	logWarn("No block added to chain")
 	logSys("Advancing to View %d  |  Next leader: Node %d", nextView, nextLeader)
 	fmt.Printf("%s%s%s\n", cYellow, bar(52), cReset)
-	cs.emitState()
-	cs.emitWeb("log", map[string]interface{}{"level": "warn", "message": fmt.Sprintf("Round aborted — advancing to view %d", nextView)})
 
 	cs.broadcast(Message{Type: "NEW_VIEW", SenderID: cs.NodeID, View: nextView})
 	if nextLeader == cs.NodeID {
@@ -1171,8 +1123,6 @@ func (cs *ConsensusState) checkAndCommit() {
 	logCommit("Chain    : %s%s%s", cWhite+cBold, chainStr, cReset)
 	logCommit("Status   : FINAL — irreversible")
 	fmt.Printf("%s%s%s\n", cPurple+cBold, bar(52), cReset)
-	cs.emitStateLocked()
-	cs.emitWeb("log", map[string]interface{}{"level": "commit", "message": fmt.Sprintf("Block %d COMMITTED — irreversible", q0.BlockID)})
 }
 
 // ─── TERMINAL INPUT ───────────────────────────────────────────────────────────
@@ -1368,7 +1318,7 @@ func autoPopulateForTwoLaptops(nodeID int, peerIPs map[int]string) {
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "Usage: ./hotstuff.exe <node_id> [id=IP ...] [-m]")
-		fmt.Fprintln(os.Stderr, "  node_id : 1–9  (port = 8000 + id)")
+		fmt.Fprintln(os.Stderr, "  node_id : 1–9  (port = 7000 + id)")
 		fmt.Fprintln(os.Stderr, "  id=IP   : peer address override, e.g.  2=192.168.1.2")
 		fmt.Fprintln(os.Stderr, "  -m      : Byzantine (malicious) node")
 		fmt.Fprintln(os.Stderr, "")
@@ -1388,7 +1338,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "node_id must be 1–9")
 		os.Exit(1)
 	}
-	// Port = 7000+nodeID for consensus, 8000+nodeID for web
+	// Port = 7000+nodeID for consensus
 	malicious := false
 	peerIPs := loadConfig() // Load from config.json first
 	if peerIPs == nil {
@@ -1438,7 +1388,6 @@ func main() {
 			cRed+cBold, cReset, cs.Port, nodeID)
 		os.Exit(1)
 	}
-	cs.startWebServer()
 
 	fmt.Printf("\n%s%s%s\n", cCyan+cBold, bar(52), cReset)
 	fmt.Printf("%s  HotStuff BFT Consensus (Hardened)%s\n", cCyan+cBold, cReset)
@@ -1461,12 +1410,7 @@ func main() {
 		fmt.Printf("  %sMalicious        : YES (Byzantine node)%s\n", cRed+cBold, cReset)
 	}
 	fmt.Printf("%s%s%s\n", cCyan, bar(52), cReset)
-	fmt.Printf("\n%s  Type 'exit' at any time to leave the cluster.%s\n", cDim, cReset)
-
-	// Print clickable dashboard link (web port is 8000+NodeID, not TCP port)
-	dashURL := fmt.Sprintf("http://localhost:%d", 8000+cs.NodeID)
-	fmt.Printf("\n%s  📊 Dashboard: %s%s%s\n", cGreen+cBold, cReset+cCyan, dashURL, cReset)
-	fmt.Printf("%s  (Right-click or Ctrl+Click to open)%s\n\n", cDim, cReset)
+	fmt.Printf("\n%s  Type 'exit' at any time to leave the cluster.%s\n\n", cDim, cReset)
 
 	go cs.inputLoop()
 	cs.discoverPeers()
