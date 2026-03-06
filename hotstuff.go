@@ -105,10 +105,96 @@ func loadConfig() map[int]string {
 	result := make(map[int]string)
 	for _, node := range cfg.Nodes {
 		if node.ID >= 1 && node.ID <= 9 && node.IP != "" {
-			result[node.ID] = node.IP
+			result[node.ID] = normalizeHost(node.IP)
 		}
 	}
 	return result
+}
+
+// normalizeHost strips whitespace and an optional :port suffix.
+func normalizeHost(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return host
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
+}
+
+// localIPv4Set returns all non-loopback IPv4 addresses on active interfaces.
+func localIPv4Set() map[string]bool {
+	res := make(map[string]bool)
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return res
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			default:
+				continue
+			}
+			ipv4 := ip.To4()
+			if ipv4 == nil || ipv4.IsLoopback() {
+				continue
+			}
+			res[ipv4.String()] = true
+		}
+	}
+	return res
+}
+
+// detectNodeIDFromConfig auto-selects node ID by matching local IPs to config.json.
+func detectNodeIDFromConfig(peerIPs map[int]string) (int, string) {
+	if len(peerIPs) == 0 {
+		return 0, "config.json has no usable node entries"
+	}
+	localIPs := localIPv4Set()
+	if len(localIPs) == 0 {
+		return 0, "no active local IPv4 addresses found"
+	}
+
+	matches := make([]int, 0, 2)
+	for id, ip := range peerIPs {
+		if localIPs[normalizeHost(ip)] {
+			matches = append(matches, id)
+		}
+	}
+	sort.Ints(matches)
+
+	if len(matches) == 1 {
+		return matches[0], ""
+	}
+
+	known := make([]string, 0, len(localIPs))
+	for ip := range localIPs {
+		known = append(known, ip)
+	}
+	sort.Strings(known)
+
+	if len(matches) == 0 {
+		return 0, fmt.Sprintf("no config.json node matches local IPs: %s", strings.Join(known, ", "))
+	}
+
+	parts := make([]string, 0, len(matches))
+	for _, id := range matches {
+		parts = append(parts, strconv.Itoa(id))
+	}
+	return 0, fmt.Sprintf("multiple node IDs match this laptop (%s); run with explicit node_id", strings.Join(parts, ", "))
 }
 
 func logSys(f string, a ...any) {
@@ -1322,15 +1408,15 @@ func (cs *ConsensusState) peerHealthCheck() {
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "Usage: ./hotstuff.exe <node_id> [id=IP ...] [-m]")
-		fmt.Fprintln(os.Stderr, "  node_id : 1–9  (port = 8000 + id)")
+	if len(os.Args) >= 2 && (os.Args[1] == "-h" || os.Args[1] == "--help") {
+		fmt.Fprintln(os.Stderr, "Usage: ./hotstuff.exe [node_id] [id=IP ...] [-m]")
+		fmt.Fprintln(os.Stderr, "  node_id : optional; auto-detected from config.json when omitted")
 		fmt.Fprintln(os.Stderr, "  id=IP   : peer address override, e.g.  2=192.168.1.2")
 		fmt.Fprintln(os.Stderr, "  -m      : Byzantine (malicious) node")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "RECOMMENDED (config.json):")
-		fmt.Fprintln(os.Stderr, "  ./hotstuff.exe 1        ← reads config.json automatically")
-		fmt.Fprintln(os.Stderr, "  ./hotstuff.exe 2")
+		fmt.Fprintln(os.Stderr, "  ./hotstuff.exe          ← auto-detect node_id from local IP")
+		fmt.Fprintln(os.Stderr, "  ./hotstuff.exe 1        ← manual override")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Same-machine (4 terminals):")
 		fmt.Fprintln(os.Stderr, "  ./hotstuff.exe 1")
@@ -1339,19 +1425,40 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  ./hotstuff.exe 4 -m")
 		os.Exit(1)
 	}
-	nodeID, err := strconv.Atoi(os.Args[1])
-	if err != nil || nodeID < 1 || nodeID > 9 {
-		fmt.Fprintln(os.Stderr, "node_id must be 1–9")
-		os.Exit(1)
-	}
 	// Port = 7000+nodeID for consensus, 8000+nodeID for web
 	malicious := false
 	peerIPs := loadConfig() // Load from config.json first
 	if peerIPs == nil {
 		peerIPs = make(map[int]string)
 	}
+
+	args := os.Args[1:]
+	nodeID := 0
+	start := 0
+	if len(args) > 0 {
+		if parsedID, err := strconv.Atoi(args[0]); err == nil {
+			if parsedID < 1 || parsedID > 9 {
+				fmt.Fprintln(os.Stderr, "node_id must be 1–9")
+				os.Exit(1)
+			}
+			nodeID = parsedID
+			start = 1
+		}
+	}
+
+	if nodeID == 0 {
+		autoID, whyNot := detectNodeIDFromConfig(peerIPs)
+		if autoID == 0 {
+			fmt.Fprintf(os.Stderr, "Auto node_id detection failed: %s\n", whyNot)
+			fmt.Fprintln(os.Stderr, "Run with explicit node_id, e.g. ./hotstuff.exe 1")
+			os.Exit(1)
+		}
+		nodeID = autoID
+		logSys("Auto-detected node_id=%d from config.json + local IP", nodeID)
+	}
+
 	// Command-line args override config.json
-	for _, a := range os.Args[2:] {
+	for _, a := range args[start:] {
 		if a == "-m" {
 			malicious = true
 			continue
@@ -1362,10 +1469,7 @@ func main() {
 			pid, perr := strconv.Atoi(parts[0])
 			if perr == nil && pid >= 1 && pid <= 9 && pid != nodeID {
 				// Strip optional port from the IP portion.
-				host := parts[1]
-				if h, _, splitErr := net.SplitHostPort(host); splitErr == nil {
-					host = h
-				}
+				host := normalizeHost(parts[1])
 				peerIPs[pid] = host
 			}
 		}

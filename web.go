@@ -3,7 +3,7 @@ package main
 // =============================================================================
 // web.go — HTTP + SSE web dashboard for HotStuff BFT
 //
-// Serves a browser-based dashboard at http://localhost:7000+NodeID.
+// Serves a browser-based dashboard at http://localhost:8000+NodeID.
 // Uses Server-Sent Events (SSE) for live push and POST for user input.
 // Zero external dependencies — only Go standard library.
 //
@@ -12,6 +12,7 @@ package main
 //   GET  /events     — SSE stream of consensus events
 //   POST /api/input  — accepts JSON {"value":"..."} and feeds it to inputLines
 //   GET  /api/state  — returns a JSON snapshot of current consensus state
+//   POST /rpc        — consensus message fallback transport
 // =============================================================================
 
 import (
@@ -248,6 +249,7 @@ func (cs *ConsensusState) startWebServer() {
 	mux.HandleFunc("/events", cs.handleSSE)
 	mux.HandleFunc("/api/input", cs.handleInput)
 	mux.HandleFunc("/api/state", cs.handleGetState)
+	mux.HandleFunc("/rpc", cs.handleRPC)
 
 	listenAddr := fmt.Sprintf("0.0.0.0:%d", webPort)
 	logSys("Web dashboard → http://localhost:%d  (binding to %s)", webPort, listenAddr)
@@ -331,4 +333,29 @@ func (cs *ConsensusState) handleGetState(w http.ResponseWriter, r *http.Request)
 	snap := cs.buildStateSnapshot()
 	cs.mu.Unlock()
 	json.NewEncoder(w).Encode(snap)
+}
+
+// handleRPC accepts consensus messages over HTTP as a fallback path when
+// direct TCP peer ports are blocked in cross-laptop environments.
+func (cs *ConsensusState) handleRPC(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var msg Message
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+
+	go cs.handleMessage(msg)
+	w.WriteHeader(http.StatusNoContent)
 }

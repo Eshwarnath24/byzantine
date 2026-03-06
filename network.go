@@ -16,9 +16,11 @@ package main
 // =============================================================================
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"time"
 )
 
@@ -30,6 +32,19 @@ func (cs *ConsensusState) peerAddr(id int) string {
 		return fmt.Sprintf("%s:%d", host, 7000+id)
 	}
 	return fmt.Sprintf("localhost:%d", 7000+id)
+}
+
+// peerHost returns just the hostname/IP for a node.
+func (cs *ConsensusState) peerHost(id int) string {
+	if host, ok := cs.nodeAddrs[id]; ok {
+		return host
+	}
+	return "localhost"
+}
+
+// peerRPCURL is the HTTP fallback endpoint for consensus message delivery.
+func (cs *ConsensusState) peerRPCURL(id int) string {
+	return fmt.Sprintf("http://%s:%d/rpc", cs.peerHost(id), 8000+id)
 }
 
 // ─── LISTENER ────────────────────────────────────────────────────────────────
@@ -78,11 +93,23 @@ func (cs *ConsensusState) sendTo(nodeID int, msg Message) {
 	addr := cs.peerAddr(nodeID)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
+		if cs.sendToHTTPFallback(nodeID, msg) {
+			cs.mu.Lock()
+			cs.sendFailures[nodeID] = 0
+			cs.mu.Unlock()
+			return
+		}
 		cs.recordSendFailure(nodeID)
 		return
 	}
 	defer conn.Close()
 	if encErr := json.NewEncoder(conn).Encode(msg); encErr != nil {
+		if cs.sendToHTTPFallback(nodeID, msg) {
+			cs.mu.Lock()
+			cs.sendFailures[nodeID] = 0
+			cs.mu.Unlock()
+			return
+		}
 		cs.recordSendFailure(nodeID)
 		return
 	}
@@ -90,6 +117,22 @@ func (cs *ConsensusState) sendTo(nodeID int, msg Message) {
 	cs.mu.Lock()
 	cs.sendFailures[nodeID] = 0
 	cs.mu.Unlock()
+}
+
+// sendToHTTPFallback tries to deliver consensus messages via HTTP /rpc on the
+// web server port. This helps cross-laptop setups when direct TCP is blocked.
+func (cs *ConsensusState) sendToHTTPFallback(nodeID int, msg Message) bool {
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return false
+	}
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	resp, err := client.Post(cs.peerRPCURL(nodeID), "application/json", bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
 // recordSendFailure increments the per-peer failure counter and triggers
@@ -212,17 +255,7 @@ func (cs *ConsensusState) discoverPeers() {
 			continue // Skip peers we already have
 		}
 
-		addr := cs.peerAddr(id)
-		conn, err := net.DialTimeout("tcp", addr, 1200*time.Millisecond)
-		if err != nil {
-			continue
-		}
-		conn.Close()
-		logNet("Found Node %d at %s — sending HELLO", id, addr)
-		cs.mu.Lock()
-		cs.peers[id] = addr
-		cs.rebuildOrder()
-		cs.mu.Unlock()
+		logNet("Trying Node %d at %s", id, cs.peerAddr(id))
 		go cs.sendTo(id, Message{Type: "HELLO", SenderID: cs.NodeID})
 		found++
 	}
@@ -272,17 +305,7 @@ func (cs *ConsensusState) tryConnectConfigPeers() {
 	}
 
 	for _, id := range toTry {
-		addr := cs.peerAddr(id)
-		conn, err := net.DialTimeout("tcp", addr, 800*time.Millisecond)
-		if err != nil {
-			continue // Will retry in 3 seconds
-		}
-		conn.Close()
-		logNet("Reached from config: Node %d at %s — sending HELLO", id, addr)
-		cs.mu.Lock()
-		cs.peers[id] = addr
-		cs.rebuildOrder()
-		cs.mu.Unlock()
+		logNet("Config-connect try: Node %d at %s", id, cs.peerAddr(id))
 		go cs.sendTo(id, Message{Type: "HELLO", SenderID: cs.NodeID})
 	}
 }

@@ -86,8 +86,8 @@ Look for **IPv4 Address** under Wi-Fi or Ethernet.
 
 **Open firewall on both laptops (run as Administrator):**
 ```
-netsh advfirewall firewall add rule name="HotStuff" dir=in action=allow protocol=TCP localport=8001-8004
-netsh advfirewall firewall add rule name="HotStuff-Web" dir=in action=allow protocol=TCP localport=7001-7004
+netsh advfirewall firewall add rule name="HotStuff-Consensus" dir=in action=allow protocol=TCP localport=7001-7004
+netsh advfirewall firewall add rule name="HotStuff-Web" dir=in action=allow protocol=TCP localport=8001-8004
 ```
 
 **Your Laptop** (e.g. `10.12.76.144`) — 2 terminals:
@@ -100,6 +100,24 @@ go run . 2 3=<friend_IP> 4=<friend_IP>
 ```
 go run . 3 1=<your_IP> 2=<your_IP>
 go run . 4 1=<your_IP> 2=<your_IP> -m
+```
+
+**Alternative (same `config.json` on both laptops):**
+
+1. Keep one shared `config.json` mapping all node IDs to laptop IPs.
+2. Start nodes with only node IDs (no extra `id=IP` args):
+```
+# Laptop A
+./hotstuff.exe 1
+./hotstuff.exe 2
+
+# Laptop B
+./hotstuff.exe 3
+./hotstuff.exe 4
+```
+3. If running one node per laptop and each laptop IP maps to exactly one node in `config.json`, you can start with auto-detection:
+```
+./hotstuff.exe
 ```
 
 > Node IDs on the same laptop discover each other via localhost automatically.  
@@ -253,7 +271,7 @@ Result: 3 YES votes ≥ quorum(3) → QC formed → block accepted
 | `No peers found` | Other nodes not started yet | Start all nodes within ~5 seconds of each other |
 | Node 2 not getting Y/N prompt | Peer not discovered | Ensure both nodes on same machine started; they auto-discover via localhost |
 | `View timeout` / `WARN VIEW TIMER` | Leader silent or crashed | Automatic — view change triggers new leader |
-| Replica keeps timing out | Network blocked | Open firewall ports 8001–8004 on both machines |
+| Replica keeps timing out | Network blocked | Open firewall ports 7001–7004 (consensus) and 8001–8004 (web/rpc) on both machines |
 | QC never forms | Not enough YES votes | Need `2f+1` YES votes; with 4 nodes quorum = 3 |
 | Dashboard not loading | Web server port blocked | Open firewall ports 7001–7004; check `Web dashboard →` line in startup output |
 | Browser prompt not appearing | SSE connection dropped | Refresh the page; the `/events` endpoint reconnects automatically |
