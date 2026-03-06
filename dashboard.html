@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>HotStuff BFT Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
+<style>
+  body { font-family: 'IBM Plex Mono', monospace; background: #0a0c10; color: #c9d1d9; }
+  .fade-in { animation: fadeIn 0.25s ease; }
+  @keyframes fadeIn { from { opacity:0; transform:translateY(-3px); } to { opacity:1; } }
+  @keyframes pulse-border { 0%,100%{ border-color: rgba(234,179,8,0.5); } 50%{ border-color: rgba(234,179,8,0.15); } }
+  .pulse-border { animation: pulse-border 2s infinite; }
+  #eventLog::-webkit-scrollbar { width: 5px; }
+  #eventLog::-webkit-scrollbar-track { background: transparent; }
+  #eventLog::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+  #blockchain::-webkit-scrollbar { height: 5px; }
+  #blockchain::-webkit-scrollbar-track { background: transparent; }
+  #blockchain::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+</style>
+</head>
+<body class="min-h-screen p-4 md:p-8">
+<div class="max-w-5xl mx-auto space-y-5">
+
+  <!-- HEADER -->
+  <div class="flex items-center justify-between">
+    <div>
+      <h1 class="text-xl font-semibold text-white tracking-tight">HotStuff BFT</h1>
+      <p class="text-xs text-slate-500 mt-0.5">
+        Node <span id="nodeId" class="text-yellow-400 font-semibold">—</span>
+        &bull; Port <span id="port" class="text-slate-400">—</span>
+        <span id="maliciousBadge" class="hidden ml-2 text-red-400 font-semibold">☠ BYZANTINE</span>
+      </p>
+    </div>
+    <div id="connBadge"
+         class="text-xs px-3 py-1 rounded-full bg-slate-800 text-slate-500 border border-slate-700">
+      ● Connecting…
+    </div>
+  </div>
+
+  <!-- CLUSTER NODES -->
+  <div>
+    <p class="text-[10px] text-slate-500 uppercase tracking-[0.2em] mb-2">Cluster</p>
+    <div id="nodesGrid" class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+      <div class="border border-slate-700 rounded-lg p-3 text-center text-slate-600 text-sm">waiting…</div>
+    </div>
+  </div>
+
+  <!-- STATUS BAR -->
+  <div class="bg-slate-800/60 rounded-lg p-3 flex flex-wrap items-center gap-x-6 gap-y-2 text-sm border border-slate-700/50">
+    <div><span class="text-slate-500">View</span>      <span id="viewNum"       class="text-white font-semibold ml-1">1</span></div>
+    <div><span class="text-slate-500">Leader</span>     <span id="leaderLabel"   class="text-yellow-400 font-semibold ml-1">—</span></div>
+    <div><span class="text-slate-500">Quorum</span>     <span id="quorumLabel"   class="text-slate-300 ml-1">—</span></div>
+    <div><span class="text-slate-500">Committed</span>  <span id="committedLabel" class="text-emerald-400 font-semibold ml-1">0</span></div>
+    <div><span class="text-slate-500">Accepted</span>   <span id="acceptedLabel"  class="text-cyan-400 ml-1">0</span></div>
+    <div class="ml-auto">
+      <span id="statusBadge" class="text-xs px-3 py-1 rounded-full bg-slate-700 text-slate-400">IDLE</span>
+    </div>
+  </div>
+
+  <!-- ACTION PANEL -->
+  <div id="actionPanel" class="hidden"></div>
+
+  <!-- BLOCK TREE -->
+  <div>
+    <p class="text-[10px] text-slate-500 uppercase tracking-[0.2em] mb-2">Block Tree</p>
+    <div id="blockchain"
+         class="overflow-auto p-4 bg-slate-900/50 rounded-lg border border-slate-700/50 min-h-[80px]">
+      <span class="text-slate-600 text-sm">Genesis only — no blocks proposed yet</span>
+    </div>
+    <div class="flex items-center gap-4 mt-2 text-[10px]">
+      <span><span class="inline-block w-2.5 h-2.5 rounded-sm bg-purple-500/40 border border-purple-500/60 mr-1 align-middle"></span>committed</span>
+      <span><span class="inline-block w-2.5 h-2.5 rounded-sm bg-cyan-500/30 border border-cyan-600/40 mr-1 align-middle"></span>QC'd (accepted)</span>
+      <span><span class="inline-block w-2.5 h-2.5 rounded-sm bg-slate-700/40 border border-slate-600/40 mr-1 align-middle"></span>pending</span>
+      <span class="text-yellow-400">[L] = locked</span>
+      <span class="text-cyan-400">[H] = highQC</span>
+    </div>
+  </div>
+
+  <!-- EVENT LOG -->
+  <div>
+    <div class="flex items-center justify-between mb-2">
+      <p class="text-[10px] text-slate-500 uppercase tracking-[0.2em]">Event Log</p>
+      <button onclick="clearLog()" class="text-[10px] text-slate-600 hover:text-slate-400 transition">clear</button>
+    </div>
+    <div id="eventLog"
+         class="bg-slate-900/50 rounded-lg p-4 border border-slate-700/50 max-h-[300px] overflow-y-auto space-y-0.5 text-xs">
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ─── STATE ───────────────────────────────────────────────────
+let state = null;
+let promptMode = null; // null | 'data' | 'vote'
+let promptView = 0;
+let currentPromptKey = '';
+
+// ─── SSE CONNECTION ──────────────────────────────────────────
+let evtSource = null;
+function connect() {
+  evtSource = new EventSource('/events');
+  evtSource.onopen = () => {
+    setConnBadge(true);
+    addLog('sys', 'Connected to backend');
+  };
+  evtSource.onerror = () => {
+    setConnBadge(false);
+    setTimeout(() => {
+      if (evtSource.readyState === EventSource.CLOSED) {
+        addLog('sys', 'Reconnecting…');
+        connect();
+      }
+    }, 2000);
+  };
+  evtSource.onmessage = (e) => {
+    try { handleEvent(JSON.parse(e.data)); } catch(_) {}
+  };
+}
+connect();
+
+function handleEvent(evt) {
+  switch (evt.type) {
+    case 'state':
+      state = evt.data;
+      renderAll();
+      syncPromptFromState();
+      break;
+    case 'log':
+      if (evt.data) addLog(evt.data.level || 'info', evt.data.message || '');
+      break;
+    case 'prompt_data':
+      showDataPrompt(evt.data, true);
+      break;
+    case 'prompt_vote':
+      showVotePrompt(evt.data, true);
+      break;
+    case 'hide_prompt':
+      hideAction();
+      break;
+  }
+}
+
+function syncPromptFromState() {
+  if (!state || !state.pendingPrompt) {
+    hideAction();
+    return;
+  }
+  const p = state.pendingPrompt;
+  if (p.type === 'data') {
+    const key = `data:${p.data?.view || 0}`;
+    if (currentPromptKey !== key) showDataPrompt(p.data || {}, false);
+    return;
+  }
+  if (p.type === 'vote') {
+    const d = p.data || {};
+    const key = `vote:${d.view || 0}:${d.blockId || 0}`;
+    if (currentPromptKey !== key) showVotePrompt(d, false);
+    return;
+  }
+  hideAction();
+}
+
+// ─── RENDER ──────────────────────────────────────────────────
+function renderAll() {
+  if (!state) return;
+  document.getElementById('nodeId').textContent      = state.nodeId;
+  document.getElementById('port').textContent         = state.port;
+  document.getElementById('viewNum').textContent      = state.view;
+  document.getElementById('leaderLabel').textContent  = 'Node ' + state.leader;
+  document.getElementById('quorumLabel').textContent  = state.quorum + '/' + state.total;
+  document.getElementById('committedLabel').textContent = state.committed;
+  document.getElementById('acceptedLabel').textContent  = state.accepted;
+  document.getElementById('maliciousBadge').classList.toggle('hidden', !state.malicious);
+  renderNodes();
+  renderBlockchain();
+  if (state.role === 'leader')
+    setStatus('LEADER', 'bg-yellow-900/60 text-yellow-300 border border-yellow-700/50');
+  else
+    setStatus('REPLICA', 'bg-slate-700 text-slate-400 border border-slate-600/50');
+}
+
+function renderNodes() {
+  const grid = document.getElementById('nodesGrid');
+  if (!state || !state.peers || state.peers.length === 0) {
+    grid.innerHTML = '<div class="border border-slate-700 rounded-lg p-3 text-center text-slate-600 text-sm">no peers</div>';
+    return;
+  }
+  grid.innerHTML = state.peers.map(p => {
+    const isLeader = p.leader;
+    const isSelf   = p.self;
+    const isMal    = state.malicious && isSelf;
+    let border, bg, text, icon, label;
+    if (isMal) {
+      border = 'border-red-600/60'; bg = 'bg-red-950/40'; text = 'text-red-400';
+      icon = '☠'; label = 'Byzantine';
+    } else if (isLeader) {
+      border = 'border-yellow-500/60'; bg = 'bg-yellow-950/30'; text = 'text-yellow-300';
+      icon = '★'; label = 'Leader';
+    } else {
+      border = 'border-slate-600/60'; bg = 'bg-slate-800/50'; text = 'text-slate-400';
+      icon = '●'; label = 'Replica';
+    }
+    const selfTag = isSelf
+      ? '<span class="text-[9px] bg-slate-600/50 px-1.5 py-0.5 rounded ml-1">YOU</span>'
+      : '';
+    return `
+      <div class="border rounded-lg p-2.5 text-center ${border} ${bg} ${text}">
+        <div class="text-lg leading-none mb-1">${icon}</div>
+        <div class="text-sm font-semibold">Node ${p.id}${selfTag}</div>
+        <div class="text-[10px] opacity-60">${label} &bull; :${p.port}</div>
+      </div>`;
+  }).join('');
+}
+
+function renderBlockchain() {
+  const el = document.getElementById('blockchain');
+  if (!state || !state.tree || !state.tree.children || state.tree.children.length === 0) {
+    el.innerHTML = '<span class="text-slate-600 text-sm">Genesis only — no blocks proposed yet</span>';
+    return;
+  }
+  // Render tree recursively using nested flex layout.
+  el.innerHTML = renderTreeNode(state.tree);
+}
+
+function renderTreeNode(node) {
+  if (!node) return '';
+
+  // Style based on status
+  let border, bg, color, statusText;
+  if (node.status === 'committed') {
+    border = 'border-purple-500/60'; bg = 'bg-purple-950/30'; color = 'text-purple-400';
+    statusText = '✓ committed';
+  } else if (node.status === 'qcd') {
+    border = 'border-cyan-600/40'; bg = 'bg-cyan-950/20'; color = 'text-cyan-500';
+    statusText = '✦ QC\'d';
+  } else {
+    border = 'border-slate-600/40'; bg = 'bg-slate-800/40'; color = 'text-slate-500';
+    statusText = '~ pending';
+  }
+
+  // Annotations
+  let tags = '';
+  if (node.locked) tags += ' <span class="text-yellow-400 text-[9px] font-bold">[L]</span>';
+  if (node.highQC) tags += ' <span class="text-cyan-400 text-[9px] font-bold">[H]</span>';
+
+  const data = node.data || '';
+  const display = data.length > 14 ? data.substring(0, 14) + '…' : data;
+  const viewLabel = node.id === 0 ? '' : `<div class="text-[9px] text-slate-600">v${node.view}</div>`;
+
+  const card = `
+    <div class="flex-shrink-0 border rounded px-3 py-2 text-center ${border} ${bg} min-w-[90px] max-w-[110px]">
+      <div class="text-[10px] ${color} font-semibold">B${node.id}${tags}</div>
+      <div class="text-[10px] text-slate-400 truncate" title="${esc(data)}">"${esc(display)}"</div>
+      <div class="text-[10px] ${color}">${statusText}</div>
+      ${viewLabel}
+    </div>`;
+
+  const children = node.children || [];
+  if (children.length === 0) {
+    return card;
+  }
+
+  if (children.length === 1) {
+    // Linear: card → child
+    return `<div class="flex items-center gap-2">
+      ${card}
+      <span class="text-slate-600 flex-shrink-0 text-sm">→</span>
+      ${renderTreeNode(children[0])}
+    </div>`;
+  }
+
+  // Fork: card → branching children (vertically stacked)
+  const branches = children.map(c =>
+    `<div class="flex items-center gap-2">
+      <span class="text-yellow-500 flex-shrink-0 text-sm">↗</span>
+      ${renderTreeNode(c)}
+    </div>`
+  ).join('');
+
+  return `<div class="flex items-start gap-2">
+    ${card}
+    <div class="flex flex-col gap-2 justify-center">
+      ${branches}
+    </div>
+  </div>`;
+}
+
+// ─── ACTION PANEL ────────────────────────────────────────────
+function showDataPrompt(data, logIt = true) {
+  promptMode = 'data';
+  promptView = data.view;
+  currentPromptKey = `data:${data.view || 0}`;
+  const panel = document.getElementById('actionPanel');
+  panel.classList.remove('hidden');
+  panel.innerHTML = `
+    <div class="bg-yellow-950/30 border border-yellow-600/40 rounded-lg p-5 fade-in pulse-border">
+      <div class="text-yellow-400 font-semibold text-sm mb-3">★ You are the Leader — View ${data.view}</div>
+      <div class="flex gap-2">
+        <input id="dataInput" type="text" placeholder="Enter block data…"
+               class="flex-1 bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white
+                      placeholder-slate-500 focus:outline-none focus:border-yellow-500 transition"
+               onkeydown="if(event.key==='Enter')submitData()"/>
+        <button onclick="submitData()"
+                class="bg-yellow-600 hover:bg-yellow-500 px-5 py-2 rounded text-sm text-white font-semibold transition">
+          Propose →
+        </button>
+      </div>
+      <p class="text-[10px] text-slate-500 mt-2">Press Enter or click Propose. Leave empty for auto-generated data.</p>
+    </div>`;
+  setTimeout(() => { const inp = document.getElementById('dataInput'); if (inp) inp.focus(); }, 50);
+  if (logIt) addLog('leader', 'Waiting for block data input…');
+}
+
+function showVotePrompt(data, logIt = true) {
+  promptMode = 'vote';
+  promptView = data.view;
+  currentPromptKey = `vote:${data.view || 0}:${data.blockId || 0}`;
+  const panel = document.getElementById('actionPanel');
+  panel.classList.remove('hidden');
+  const csOk = data.checksumOk !== false;
+  const csBadge = csOk
+    ? '<span class="text-emerald-400 font-semibold">✓ VALID</span>'
+    : '<span class="text-red-400 font-semibold">✗ INVALID — Byzantine detected</span>';
+  panel.innerHTML = `
+    <div class="bg-cyan-950/20 border border-cyan-600/40 rounded-lg p-5 fade-in">
+      <div class="text-cyan-400 font-semibold text-sm mb-3">📋 Proposal Received — View ${data.view}</div>
+      <div class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs mb-4">
+        <span class="text-slate-500">Leader</span>    <span>Node ${data.leaderId}</span>
+        <span class="text-slate-500">Block ID</span>  <span>${data.blockId}</span>
+        <span class="text-slate-500">Parent</span>    <span>Block ${data.parentId}</span>
+        <span class="text-slate-500">Data</span>      <span class="text-purple-400">"${esc(data.data)}"</span>
+        <span class="text-slate-500">Checksum</span>  <span>${esc(data.checksum)} ${csBadge}</span>
+      </div>
+      <div class="flex gap-3">
+        <button onclick="submitVote('y')"
+                class="flex-1 bg-emerald-700 hover:bg-emerald-600 px-4 py-2.5 rounded
+                       text-white font-semibold transition text-sm">
+          ✓ YES — Accept
+        </button>
+        <button onclick="submitVote('n')"
+                class="flex-1 bg-red-800 hover:bg-red-700 px-4 py-2.5 rounded
+                       text-white font-semibold transition text-sm">
+          ✗ NO — Reject
+        </button>
+      </div>
+    </div>`;
+  if (logIt) addLog('info', `Proposal from Node ${data.leaderId}: Block ${data.blockId} data="${esc(data.data)}"`);
+}
+
+function hideAction() {
+  promptMode = null;
+  currentPromptKey = '';
+  const panel = document.getElementById('actionPanel');
+  panel.classList.add('hidden');
+  panel.innerHTML = '';
+}
+
+async function submitData() {
+  const inp = document.getElementById('dataInput');
+  const value = inp ? inp.value.trim() : '';
+  addLog('leader', value ? `Proposing: "${esc(value)}"` : 'Proposing with auto-generated data');
+  hideAction();
+  await postInput(value);
+}
+
+async function submitVote(v) {
+  addLog('vote', v === 'y' ? 'Voted YES ✓' : 'Voted NO ✗');
+  hideAction();
+  await postInput(v);
+}
+
+async function postInput(value) {
+  try {
+    await fetch('/api/input', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({value})
+    });
+  } catch (e) {
+    addLog('err', 'Failed to send input: ' + e.message);
+  }
+}
+
+// ─── EVENT LOG ───────────────────────────────────────────────
+const levelColors = {
+  sys:    'text-slate-400',
+  info:   'text-slate-300',
+  net:    'text-blue-400',
+  leader: 'text-yellow-400',
+  vote:   'text-emerald-400',
+  qc:     'text-cyan-400',
+  commit: 'text-purple-400',
+  warn:   'text-yellow-500',
+  err:    'text-red-400',
+};
+
+function addLog(level, msg) {
+  const el = document.getElementById('eventLog');
+  const t = new Date().toLocaleTimeString('en', {hour12: false});
+  const color = levelColors[level] || 'text-slate-300';
+  const tag = (level || 'info').toUpperCase().padEnd(6, '\u00A0');
+  const div = document.createElement('div');
+  div.className = 'fade-in ' + color;
+  div.innerHTML = `<span class="text-slate-600">${t}</span> <span class="text-slate-500">[${tag}]</span> ${msg}`;
+  el.insertBefore(div, el.firstChild);
+  while (el.children.length > 150) el.removeChild(el.lastChild);
+}
+
+function clearLog() {
+  document.getElementById('eventLog').innerHTML = '';
+  addLog('sys', 'Log cleared');
+}
+
+// ─── HELPERS ─────────────────────────────────────────────────
+function setConnBadge(ok) {
+  const el = document.getElementById('connBadge');
+  if (ok) {
+    el.textContent = '● Connected';
+    el.className = 'text-xs px-3 py-1 rounded-full bg-emerald-900/40 text-emerald-400 border border-emerald-700/40';
+  } else {
+    el.textContent = '● Disconnected';
+    el.className = 'text-xs px-3 py-1 rounded-full bg-red-900/40 text-red-400 border border-red-700/40';
+  }
+}
+
+function setStatus(text, cls) {
+  const b = document.getElementById('statusBadge');
+  b.textContent = text;
+  b.className = 'text-xs px-3 py-1 rounded-full ' + cls;
+}
+
+function esc(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.appendChild(document.createTextNode(s));
+  return d.innerHTML;
+}
+</script>
+</body>
+</html>
