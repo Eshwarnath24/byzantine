@@ -178,6 +178,28 @@ func (cs *ConsensusState) getOrCreateConnection(peerID int) (net.Conn, error) {
 	connectionPool[peerID] = conn
 	connectionPoolMu.Unlock()
 
+	// Send HELLO to establish identity with the peer
+	helloMsg := Message{
+		Type:       "HELLO",
+		SenderID:   cs.NodeID,
+		SenderPort: cs.Port,
+	}
+	encoder := json.NewEncoder(conn)
+	conn.SetWriteDeadline(time.Now().Add(tcpDialTimeout))
+	err = encoder.Encode(helloMsg)
+	conn.SetWriteDeadline(time.Time{})
+
+	if err != nil {
+		connectionPoolMu.Lock()
+		delete(connectionPool, peerID)
+		connectionPoolMu.Unlock()
+		conn.Close()
+		return nil, fmt.Errorf("failed to send HELLO: %w", err)
+	}
+
+	// Start reading from this connection
+	go cs.handleConnection(conn)
+
 	return conn, nil
 }
 
@@ -384,6 +406,14 @@ func (cs *ConsensusState) tryConnectToPeer(peerID int) {
 		SenderID:   cs.NodeID,
 		SenderPort: cs.Port,
 	}
+
+	// Store connection in pool BEFORE sending HELLO
+	connectionPoolMu.Lock()
+	if existing, exists := connectionPool[peerID]; exists {
+		existing.Close() // Close old connection
+	}
+	connectionPool[peerID] = conn
+	connectionPoolMu.Unlock()
 
 	encoder := json.NewEncoder(conn)
 	conn.SetWriteDeadline(time.Now().Add(tcpDialTimeout))
