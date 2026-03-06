@@ -398,7 +398,11 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		cs.mu.Lock()
 		isNew := false
 		if _, exists := cs.peers[msg.SenderID]; !exists {
-			cs.peers[msg.SenderID] = cs.peerAddr(msg.SenderID)
+			host := "localhost"
+			if configured, ok := cs.nodeAddrs[msg.SenderID]; ok && configured != "" {
+				host = configured
+			}
+			cs.peers[msg.SenderID] = fmt.Sprintf("%s:%d", host, 7000+msg.SenderID)
 			cs.addToJoinOrder(msg.SenderID) // append in arrival order (no sort)
 			cs.rebuildOrder()
 			isNew = true
@@ -475,7 +479,11 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 					newOrder = append(newOrder, id)
 					if id != cs.NodeID {
 						if _, exists := cs.peers[id]; !exists {
-							cs.peers[id] = cs.peerAddr(id)
+							host := "localhost"
+							if configured, ok := cs.nodeAddrs[id]; ok && configured != "" {
+								host = configured
+							}
+							cs.peers[id] = fmt.Sprintf("%s:%d", host, 7000+id)
 						}
 					}
 				}
