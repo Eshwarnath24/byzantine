@@ -1175,11 +1175,23 @@ func (cs *ConsensusState) readLine() string {
 		}
 	}
 done:
-	select {
-	case line := <-cs.inputLines:
-		return strings.TrimSpace(line)
-	case <-cs.stopCh:
-		return ""
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case line := <-cs.inputLines:
+			return strings.TrimSpace(line)
+		case <-ticker.C:
+			cs.mu.Lock()
+			stillLeader := cs.isLeaderThisView() && cs.inRound
+			cs.mu.Unlock()
+			if !stillLeader {
+				return ""
+			}
+		case <-cs.stopCh:
+			return ""
+		}
 	}
 }
 
