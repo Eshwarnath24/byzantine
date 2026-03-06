@@ -70,7 +70,7 @@ type ClusterConfig struct {
 const (
 	viewTimeout      = 20 * time.Second // replica waits this long for a proposal
 	votePhaseTimeout = 12 * time.Second // leader waits this long for votes (A)
-	maxSendFailures  = 5                // consecutive TCP failures before peer removal (D)
+	maxSendFailures  = 30               // consecutive TCP failures before peer removal (D) - increased for cross-laptop
 )
 
 //  ANSI COLORS

@@ -91,7 +91,7 @@ func (cs *ConsensusState) handleConn(conn net.Conn) {
 // Consecutive failures are tracked; the peer is removed after maxSendFailures.
 func (cs *ConsensusState) sendTo(nodeID int, msg Message) {
 	addr := cs.peerAddr(nodeID)
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
 		if cs.sendToHTTPFallback(nodeID, msg) {
 			cs.mu.Lock()
@@ -126,13 +126,18 @@ func (cs *ConsensusState) sendToHTTPFallback(nodeID int, msg Message) bool {
 	if err != nil {
 		return false
 	}
-	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	client := &http.Client{Timeout: 5000 * time.Millisecond}
 	resp, err := client.Post(cs.peerRPCURL(nodeID), "application/json", bytes.NewReader(body))
 	if err != nil {
+		logNet("HTTP fallback to Node %d failed: %v", nodeID, err)
 		return false
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode >= 200 && resp.StatusCode < 300
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		logNet("HTTP fallback to Node %d succeeded", nodeID)
+		return true
+	}
+	return false
 }
 
 // recordSendFailure increments the per-peer failure counter and triggers
@@ -270,7 +275,7 @@ func (cs *ConsensusState) discoverPeers() {
 // discoveryLoop keeps trying peer discovery so nodes on different laptops can
 // still connect even if they start at different times or have transient delays.
 func (cs *ConsensusState) discoveryLoop() {
-	ticker := time.NewTicker(3 * time.Second) // More aggressive: every 3 seconds
+	ticker := time.NewTicker(5 * time.Second) // Every 5 seconds - less aggressive but more reliable
 	defer ticker.Stop()
 	for {
 		select {
