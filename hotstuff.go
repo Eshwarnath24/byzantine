@@ -43,7 +43,6 @@
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"hash/crc32"
 	"math/rand"
@@ -57,15 +56,6 @@ import (
 )
 
 //  CONFIG & TUNABLES
-
-type NodeConfig struct {
-	ID int    `json:"id"`
-	IP string `json:"ip"`
-}
-
-type ClusterConfig struct {
-	Nodes []NodeConfig `json:"nodes"`
-}
 
 const (
 	viewTimeout      = 20 * time.Second // replica waits this long for a proposal
@@ -90,26 +80,6 @@ const (
 
 func now() string      { return time.Now().Format("15:04:05.000") }
 func bar(n int) string { return strings.Repeat("─", n) }
-
-// loadConfig attempts to read config.json and return peer IPs keyed by node ID.
-func loadConfig() map[int]string {
-	data, err := os.ReadFile("config.json")
-	if err != nil {
-		return nil // config.json not found, use command-line args only
-	}
-	var cfg ClusterConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing config.json: %v\n", err)
-		return nil
-	}
-	result := make(map[int]string)
-	for _, node := range cfg.Nodes {
-		if node.ID >= 1 && node.ID <= 9 && node.IP != "" {
-			result[node.ID] = node.IP
-		}
-	}
-	return result
-}
 
 func logSys(f string, a ...any) {
 	fmt.Printf("%s[%s] [SYS]   %s %s\n", cDim, now(), cReset, fmt.Sprintf(f, a...))
@@ -1287,68 +1257,23 @@ func (cs *ConsensusState) peerHealthCheck() {
 	}
 }
 
-// ─── TWO-LAPTOP AUTO-DETECT ─────────────────────────────────────────────────────
-
-// autoPopulateForTwoLaptops auto-detects and populates nodeAddrs for two-laptop setup.
-// All nodes in config with the same IP as myNodeID are on "my" laptop.
-// All nodes with a different IP are on "friend's" laptop.
-func autoPopulateForTwoLaptops(nodeID int, peerIPs map[int]string) {
-	myIP := ""
-	uniqueIPs := make(map[string]bool)
-
-	for id, ip := range peerIPs {
-		if ip == "" {
-			continue
-		}
-		uniqueIPs[ip] = true
-		if id == nodeID {
-			myIP = ip
-		}
-	}
-
-	if myIP == "" || len(uniqueIPs) < 2 {
-		return // not a two-laptop setup
-	}
-
-	var friendIP string
-	for ip := range uniqueIPs {
-		if ip != myIP {
-			friendIP = ip
-			break
-		}
-	}
-
-	if friendIP == "" {
-		return
-	}
-
-	for id, ip := range peerIPs {
-		if id != nodeID && ip == friendIP {
-			peerIPs[id] = friendIP
-		}
-	}
-
-	logNet("Auto-detected two-laptop: my=%s, friend=%s", myIP, friendIP)
-}
-
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "Usage: ./hotstuff.exe <node_id> [id=IP ...] [-m]")
 		fmt.Fprintln(os.Stderr, "  node_id : 1–9  (port = 7000 + id)")
-		fmt.Fprintln(os.Stderr, "  id=IP   : peer address override, e.g.  2=192.168.1.2")
+		fmt.Fprintln(os.Stderr, "  id=IP   : peer address, e.g.  2=192.168.1.101")
 		fmt.Fprintln(os.Stderr, "  -m      : Byzantine (malicious) node")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "RECOMMENDED (config.json):")
-		fmt.Fprintln(os.Stderr, "  ./hotstuff.exe 1        ← reads config.json automatically")
-		fmt.Fprintln(os.Stderr, "  ./hotstuff.exe 2")
+		fmt.Fprintln(os.Stderr, "Examples:")
+		fmt.Fprintln(os.Stderr, "  Same-machine:")
+		fmt.Fprintln(os.Stderr, "    ./hotstuff.exe 1")
+		fmt.Fprintln(os.Stderr, "    ./hotstuff.exe 2")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Same-machine (4 terminals):")
-		fmt.Fprintln(os.Stderr, "  ./hotstuff.exe 1")
-		fmt.Fprintln(os.Stderr, "  ./hotstuff.exe 2")
-		fmt.Fprintln(os.Stderr, "  ./hotstuff.exe 3")
-		fmt.Fprintln(os.Stderr, "  ./hotstuff.exe 4 -m")
+		fmt.Fprintln(os.Stderr, "  Two laptops:")
+		fmt.Fprintln(os.Stderr, "    Laptop 1: ./hotstuff.exe 1 2=10.12.227.66")
+		fmt.Fprintln(os.Stderr, "    Laptop 2: ./hotstuff.exe 2 1=10.12.226.231")
 		os.Exit(1)
 	}
 	nodeID, err := strconv.Atoi(os.Args[1])
@@ -1358,18 +1283,9 @@ func main() {
 	}
 	// Port = 7000+nodeID for consensus
 	malicious := false
-	peerIPs := loadConfig() // Load from config.json first
-	if peerIPs == nil {
-		peerIPs = make(map[int]string)
-	}
-	cliPeerOverrides := false
+	peerIPs := make(map[int]string)
 
-	// Auto-detect two-laptop setup from config.json and populate nodeAddrs
-	if len(peerIPs) > 0 {
-		autoPopulateForTwoLaptops(nodeID, peerIPs)
-	}
-
-	// Command-line args override config.json
+	// Parse command-line args for peer IPs and flags
 	for _, a := range os.Args[2:] {
 		if a == "-m" {
 			malicious = true
@@ -1380,12 +1296,6 @@ func main() {
 		if len(parts) == 2 {
 			pid, perr := strconv.Atoi(parts[0])
 			if perr == nil && pid >= 1 && pid <= 9 && pid != nodeID {
-				if !cliPeerOverrides {
-					// If explicit id=IP args are provided, use them as the source
-					// of truth instead of mixing with config.json peers.
-					peerIPs = make(map[int]string)
-					cliPeerOverrides = true
-				}
 				// Strip optional port from the IP portion.
 				host := parts[1]
 				if h, _, splitErr := net.SplitHostPort(host); splitErr == nil {
@@ -1424,7 +1334,7 @@ func main() {
 	fmt.Printf("  Max send fails   : %d\n", maxSendFailures)
 	fmt.Printf("  Time             : %s\n", now())
 	if len(cs.nodeAddrs) > 0 {
-		fmt.Printf("  %sMode             : MULTI-LAPTOP (config.json)%s\n", cGreen+cBold, cReset)
+		fmt.Printf("  %sMode             : MULTI-LAPTOP%s\n", cGreen+cBold, cReset)
 		for id, ip := range cs.nodeAddrs {
 			fmt.Printf("  %sPeer Node %-2d     : %s:%d%s\n", cGreen, id, ip, 7000+id, cReset)
 		}

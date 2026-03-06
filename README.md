@@ -11,10 +11,10 @@ A fully working implementation of the **HotStuff Byzantine Fault Tolerant (BFT)*
 | File | Purpose |
 |------|---------|
 | `hotstuff.go` | Core consensus state machine, protocol logic, leader/replica roles |
-| `network.go` | TCP transport — listener, send, broadcast, peer discovery |
+| `network.go` | **NEW!** TCP peer-to-peer transport with persistent connections, connection pooling, UDP beacon discovery |
 | `tree.go` | Explicit block tree with parent-child links, locking, and commit pruning |
-| `web.go` | HTTP + SSE web dashboard server; REST input endpoint |
-| `dashboard.html` | Browser dashboard UI (embedded into binary at build time) |
+| `config.json` | Cluster configuration — maps node IDs to IP addresses for multi-laptop deployment |
+| `NETWORK_SETUP_GUIDE.md` | Complete guide for setting up TCP connections between different laptops |
 | `go.mod` | Go module definition |
 
 ---
@@ -22,13 +22,16 @@ A fully working implementation of the **HotStuff Byzantine Fault Tolerant (BFT)*
 ## Features
 
 - **Interactive terminal voting** — replicas type `y`/`n` to approve or reject proposals
-- **Browser-based web dashboard** — live view of cluster state, blockchain, and event log at `http://localhost:7000+NodeID`; supports voting and data entry directly from the browser
+- **TCP peer-to-peer networking** — each node acts as both server and client, with persistent connections
+- **Connection pooling** — efficient reuse of TCP connections with automatic reconnection on failure
+- **UDP beacon discovery** — automatic LAN peer discovery without manual configuration
+- **Multi-laptop support** — seamless deployment across different machines using config.json
 - **Byzantine fault tolerance** — tolerates `f = (n-1)/3` faulty nodes; run any node with `-m` to simulate a Byzantine attacker
 - **3-chain commit rule** — a block is finalized only after 3 consecutive QC'd descendants
 - **Leader rotation** — leadership cycles through all nodes in join-arrival order
-- **Automatic peer discovery** — nodes scan localhost ports and configured IPs on startup
+- **Automatic peer discovery** — nodes use config.json or UDP beacons to find peers
 - **View-change timeouts** — view advances automatically if the leader is silent or quorum stalls
-- **Crash detection** — peers are removed after 3 consecutive TCP failures
+- **Robust crash detection** — peers are removed after 30 consecutive TCP failures
 - **CRC32 checksum validation** — Byzantine nodes send a corrupted checksum; honest replicas auto-reject
 - **Color-coded logging** — LEADER (yellow), VOTE (green), QC (cyan), COMMIT (purple), ERR (red)
 
@@ -36,13 +39,14 @@ A fully working implementation of the **HotStuff Byzantine Fault Tolerant (BFT)*
 
 ## Consensus Parameters
 
-| Parameter | Value |
-|-----------|-------|
-| Node IDs | 1 – 9 |
-| Consensus port | `8000 + NodeID` (Node 1 → 8001, Node 4 → 8004) |
-| Web dashboard port | `7000 + NodeID` (Node 1 → http://localhost:7001, Node 4 → http://localhost:7004) |
+| TCP Server port | `7000 + NodeID` (Node 1 → 7001, Node 2 → 7002) |
+| UDP Beacon port | `7999` (fixed, for LAN discovery) |
 | Quorum | `2f + 1` |
 | Fault tolerance | `f = (n-1)/3` |
+| View timeout | 20 seconds |
+| Vote-phase timeout | 12 seconds |
+| TCP connection timeout | 5 seconds (tuned for cross-laptop latency) |
+| Max send failures | 30= (n-1)/3` |
 | View timeout | 20 seconds |
 | Vote-phase timeout | 12 seconds |
 | Max send failures | 3 (then peer is removed) |

@@ -1,145 +1,307 @@
 package main
 
-// =============================================================================
-// network.go — TCP transport layer for HotStuff BFT
-//
-// Responsibilities:
-//   • Peer address resolution (peerAddr)
-//   • TCP listener (startListener / handleConn)
-//   • Reliable unicast with failure tracking (sendTo / recordSendFailure)
-//   • Dynamic peer removal on crash (removePeer)
-//   • Broadcast to all live peers (broadcast)
-//   • Startup peer discovery by port scan (discoverPeers)
-//
-// All methods are defined on *ConsensusState (declared in hotstuff.go) so
-// they share the same mutex and protocol fields without any extra wiring.
-// =============================================================================
-
 import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 )
 
-// peerAddr returns the TCP address for a given node ID.
-// If a host was configured via the id=IP command-line argument it is used;
-// otherwise "localhost" is assumed (same-machine / single-terminal mode).
-func (cs *ConsensusState) peerAddr(id int) string {
-	if host, ok := cs.nodeAddrs[id]; ok {
-		return fmt.Sprintf("%s:%d", host, 7000+id)
-	}
-	return fmt.Sprintf("localhost:%d", 7000+id)
-}
+// ═════════════════════════════════════════════════════════════════════════════
+//  NETWORK LAYER — TCP Peer-to-Peer Implementation
+//
+//  Both nodes act as servers AND clients:
+//    • Each node runs a TCP server listening on port 7000+nodeID
+//    • Each node can connect as a client to other nodes' servers
+//    • Connections are persistent and bidirectional
+//    • Failed connections are retried automatically
+//    • UDP beacon discovery helps nodes find each other on LAN
+// ═════════════════════════════════════════════════════════════════════════════
 
-// peerHost returns just the hostname/IP for a node.
-func (cs *ConsensusState) peerHost(id int) string {
-	if host, ok := cs.nodeAddrs[id]; ok {
-		return host
-	}
-	return "localhost"
-}
+const (
+	tcpDialTimeout    = 5 * time.Second // Increased for cross-laptop latency
+	httpClientTimeout = 5 * time.Second // Increased for cross-laptop latency
+	udpBeaconPort     = 7999            // UDP port for peer discovery broadcasts
+	udpBeaconInterval = 3 * time.Second // How often to broadcast presence
+)
 
-// ─── LISTENER ────────────────────────────────────────────────────────────────
+// connectionPool maintains persistent TCP connections to peers.
+// Key = peerID, Value = net.Conn
+var (
+	connectionPool   = make(map[int]net.Conn)
+	connectionPoolMu sync.RWMutex
+)
 
-// startListener opens a TCP server on this node's port and spawns a goroutine
-// per incoming connection.
+// ─── TCP SERVER ───────────────────────────────────────────────────────────────
+
+// startListener starts the TCP server on port 7000+nodeID.
+// This allows the node to accept incoming connections from other nodes.
 func (cs *ConsensusState) startListener() error {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", cs.Port))
+	addr := fmt.Sprintf(":%d", cs.Port)
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
-	cs.listener = ln
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				select {
-				case <-cs.stopCh:
-					return
-				default:
-					continue
-				}
-			}
-			go cs.handleConn(conn)
-		}
-	}()
+	cs.listener = listener
+	logNet("TCP server started on port %d", cs.Port)
+
+	go cs.acceptLoop()
 	return nil
 }
 
-// handleConn decodes exactly one JSON message from the connection and
-// dispatches it to the consensus message handler.
-func (cs *ConsensusState) handleConn(conn net.Conn) {
-	defer conn.Close()
-	var msg Message
-	if err := json.NewDecoder(conn).Decode(&msg); err != nil {
-		return
+// acceptLoop continuously accepts incoming TCP connections.
+// Each connection is handled in a separate goroutine.
+func (cs *ConsensusState) acceptLoop() {
+	for {
+		conn, err := cs.listener.Accept()
+		if err != nil {
+			select {
+			case <-cs.stopCh:
+				return
+			default:
+				logErr("Accept error: %v", err)
+				continue
+			}
+		}
+
+		// Handle each connection in a separate goroutine
+		go cs.handleConnection(conn)
 	}
-	cs.handleMessage(msg)
 }
 
-// ─── SEND / BROADCAST ────────────────────────────────────────────────────────
+// handleConnection reads messages from an incoming TCP connection.
+// It expects JSON-encoded messages separated by newlines.
+func (cs *ConsensusState) handleConnection(conn net.Conn) {
+	defer conn.Close()
 
-// sendTo (D) opens a fresh TCP connection, sends msg as JSON, then closes.
-// Consecutive failures are tracked; the peer is removed after maxSendFailures.
-func (cs *ConsensusState) sendTo(nodeID int, msg Message) {
-	addr := cs.peerAddr(nodeID)
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	decoder := json.NewDecoder(conn)
+	var firstMessage bool = true
+	var senderID int
+
+	for {
+		select {
+		case <-cs.stopCh:
+			return
+		default:
+		}
+
+		// Set read deadline to detect dead connections
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+		var msg Message
+		if err := decoder.Decode(&msg); err != nil {
+			if err, ok := err.(net.Error); ok && err.Timeout() {
+				// Connection idle timeout - continue waiting
+				continue
+			}
+			// Connection closed or decode error
+			if senderID > 0 {
+				logNet("Connection from Node %d closed", senderID)
+			}
+			return
+		}
+
+		// On first message, store the sender ID and register the connection
+		if firstMessage && msg.SenderID > 0 {
+			senderID = msg.SenderID
+			firstMessage = false
+
+			// Store this connection for sending messages back
+			connectionPoolMu.Lock()
+			if existing, exists := connectionPool[senderID]; exists {
+				existing.Close() // Close old connection
+			}
+			connectionPool[senderID] = conn
+			connectionPoolMu.Unlock()
+
+			logNet("Registered incoming connection from Node %d (%s)", senderID, conn.RemoteAddr())
+		}
+
+		// Reset send failures on successful message receipt
+		cs.mu.Lock()
+		cs.sendFailures[msg.SenderID] = 0
+		cs.mu.Unlock()
+
+		// Process the message
+		cs.handleMessage(msg)
+	}
+}
+
+// ─── TCP CLIENT ───────────────────────────────────────────────────────────────
+
+// peerAddr returns the network address for a given peer ID.
+// If nodeAddrs contains an explicit IP, use it; otherwise use localhost.
+func (cs *ConsensusState) peerAddr(peerID int) string {
+	if peerID == cs.NodeID {
+		return ""
+	}
+
+	cs.mu.Lock()
+	host, hasExplicitIP := cs.nodeAddrs[peerID]
+	cs.mu.Unlock()
+
+	if !hasExplicitIP || host == "" {
+		host = "localhost"
+	}
+
+	port := 7000 + peerID
+	return fmt.Sprintf("%s:%d", host, port)
+}
+
+// getOrCreateConnection gets an existing connection or creates a new one to the peer.
+// Returns the connection and a boolean indicating if it's a new connection.
+func (cs *ConsensusState) getOrCreateConnection(peerID int) (net.Conn, error) {
+	// Check if connection already exists
+	connectionPoolMu.RLock()
+	conn, exists := connectionPool[peerID]
+	connectionPoolMu.RUnlock()
+
+	if exists {
+		// Test if connection is still alive by setting a deadline
+		conn.SetWriteDeadline(time.Now().Add(1 * time.Millisecond))
+		_, err := conn.Write([]byte{})
+		conn.SetWriteDeadline(time.Time{}) // Clear deadline
+
+		if err == nil {
+			return conn, nil // Connection is alive
+		}
+
+		// Connection is dead, remove it
+		connectionPoolMu.Lock()
+		delete(connectionPool, peerID)
+		connectionPoolMu.Unlock()
+		conn.Close()
+	}
+
+	// Create new connection
+	addr := cs.peerAddr(peerID)
+	if addr == "" {
+		return nil, fmt.Errorf("invalid peer address")
+	}
+
+	dialer := net.Dialer{Timeout: tcpDialTimeout}
+	conn, err := dialer.Dial("tcp", addr)
 	if err != nil {
-		cs.recordSendFailure(nodeID)
+		return nil, fmt.Errorf("dial failed: %w", err)
+	}
+
+	// Store the new connection
+	connectionPoolMu.Lock()
+	connectionPool[peerID] = conn
+	connectionPoolMu.Unlock()
+
+	return conn, nil
+}
+
+// sendTo sends a message to a specific peer using TCP.
+// Tracks consecutive failures and removes dead peers.
+func (cs *ConsensusState) sendTo(peerID int, msg Message) {
+	if peerID == cs.NodeID {
+		return // Don't send to self
+	}
+
+	conn, err := cs.getOrCreateConnection(peerID)
+	if err != nil {
+		cs.incrementFailureCount(peerID)
 		return
 	}
-	defer conn.Close()
-	if encErr := json.NewEncoder(conn).Encode(msg); encErr != nil {
-		cs.recordSendFailure(nodeID)
+
+	// Encode and send the message
+	encoder := json.NewEncoder(conn)
+	conn.SetWriteDeadline(time.Now().Add(tcpDialTimeout))
+	err = encoder.Encode(msg)
+	conn.SetWriteDeadline(time.Time{}) // Clear deadline
+
+	if err != nil {
+		// Send failed, close connection and increment failure count
+		connectionPoolMu.Lock()
+		delete(connectionPool, peerID)
+		connectionPoolMu.Unlock()
+		conn.Close()
+
+		cs.incrementFailureCount(peerID)
 		return
 	}
-	// Success: reset failure counter.
+
+	// Success - reset failure count
 	cs.mu.Lock()
-	cs.sendFailures[nodeID] = 0
+	cs.sendFailures[peerID] = 0
 	cs.mu.Unlock()
 }
 
-// recordSendFailure increments the per-peer failure counter and triggers
-// peer removal after maxSendFailures consecutive failures.
-func (cs *ConsensusState) recordSendFailure(nodeID int) {
+// broadcast sends a message to all known peers.
+func (cs *ConsensusState) broadcast(msg Message) {
 	cs.mu.Lock()
-	cs.sendFailures[nodeID]++
-	fails := cs.sendFailures[nodeID]
-	_, stillPeer := cs.peers[nodeID]
+	peerIDs := make([]int, 0, len(cs.peers))
+	for id := range cs.peers {
+		peerIDs = append(peerIDs, id)
+	}
+
+	// Also broadcast to configured but not-yet-connected peers in multi-laptop mode
+	if len(cs.nodeAddrs) > 0 {
+		for id := range cs.nodeAddrs {
+			if id != cs.NodeID {
+				found := false
+				for _, existing := range peerIDs {
+					if existing == id {
+						found = true
+						break
+					}
+				}
+				if !found {
+					peerIDs = append(peerIDs, id)
+				}
+			}
+		}
+	}
 	cs.mu.Unlock()
-	if fails >= maxSendFailures && stillPeer {
-		logErr("Node %d unreachable (%dx) — removing from cluster", nodeID, fails)
-		cs.removePeer(nodeID, true)
+
+	for _, peerID := range peerIDs {
+		go cs.sendTo(peerID, msg)
 	}
 }
 
-// removePeer (D, E) — removes a crashed/departed node from the peer set and,
-// when warranted, advances the view so the remaining nodes can make progress.
-func (cs *ConsensusState) removePeer(nodeID int, restartRound bool) {
+// incrementFailureCount increments the failure counter for a peer and removes it if threshold exceeded.
+func (cs *ConsensusState) incrementFailureCount(peerID int) {
 	cs.mu.Lock()
-	if _, exists := cs.peers[nodeID]; !exists {
+	cs.sendFailures[peerID]++
+	failures := cs.sendFailures[peerID]
+	cs.mu.Unlock()
+
+	if failures >= maxSendFailures {
+		logWarn("Node %d unreachable after %d attempts — removing from cluster", peerID, maxSendFailures)
+		cs.removePeer(peerID, false)
+	}
+}
+
+// removePeer removes a peer from the cluster and triggers a membership change.
+func (cs *ConsensusState) removePeer(peerID int, graceful bool) {
+	cs.mu.Lock()
+	_, existed := cs.peers[peerID]
+	if !existed {
 		cs.mu.Unlock()
 		return
 	}
-	wasLeader := cs.leaderForView(cs.currentView) == nodeID
-	delete(cs.peers, nodeID)
-	delete(cs.sendFailures, nodeID)
+
+	delete(cs.peers, peerID)
+	delete(cs.sendFailures, peerID)
+
+	// Remove from join order
+	newJoinOrder := []int{}
+	for _, id := range cs.joinOrder {
+		if id != peerID {
+			newJoinOrder = append(newJoinOrder, id)
+		}
+	}
+	cs.joinOrder = newJoinOrder
+
+	oldCount := cs.totalNodes()
 	cs.rebuildOrder()
-	fmt.Printf("\n%s%s%s\n", cYellow+cBold, bar(52), cReset)
-	logWarn("Node %d removed from cluster", nodeID)
-	logSys("Cluster: %v  total=%d  quorum=%d  f=%d",
-		cs.peerOrder, cs.totalNodes(), cs.quorum(), cs.faultTolerance())
-	fmt.Printf("%s%s%s\n", cYellow, bar(52), cReset)
+	newCount := cs.totalNodes()
 
-	if !restartRound || (!wasLeader && !cs.inRound) {
-		cs.mu.Unlock()
-		return
-	}
-
-	// Advance view so the new membership is reflected immediately (E).
-	newView := cs.currentView + 1
-	cs.currentView = newView
+	wasInRound := cs.inRound
+	wasLeader := cs.isLeaderThisView()
 	cs.inRound = false
 	cs.pendingBlock = nil
 	cs.proposalForView = nil
@@ -147,264 +309,255 @@ func (cs *ConsensusState) removePeer(nodeID int, restartRound bool) {
 	cs.noVotesForView = make(map[int]bool)
 	cs.stopViewTimer()
 	cs.stopVotePhaseTimer()
-	newLeader := cs.leaderForView(newView)
 	cs.mu.Unlock()
 
-	logWarn("Membership change — restarting at view %d  |  leader: Node %d", newView, newLeader)
-	cs.broadcast(Message{Type: "NEW_VIEW", SenderID: cs.NodeID, View: newView})
-	if newLeader == cs.NodeID {
-		go cs.runLeaderRound()
+	// Close connection
+	connectionPoolMu.Lock()
+	if conn, exists := connectionPool[peerID]; exists {
+		conn.Close()
+		delete(connectionPool, peerID)
+	}
+	connectionPoolMu.Unlock()
+
+	if graceful {
+		logNet("Node %d left gracefully", peerID)
 	} else {
+		logErr("Node %d removed due to connectivity failure", peerID)
+	}
+
+	if oldCount != newCount && newCount > 0 {
 		cs.mu.Lock()
-		cs.inRound = true
-		cs.startViewTimer()
+		logSys("Cluster membership changed: %v  |  total=%d  quorum=%d  f=%d",
+			cs.peerOrder, cs.totalNodes(), cs.quorum(), cs.faultTolerance())
+		view := cs.currentView
+		leader := cs.leaderForView(view)
 		cs.mu.Unlock()
+
+		if wasInRound || wasLeader {
+			logWarn("Restarting round due to membership change")
+			cs.broadcast(Message{Type: "NEW_VIEW", SenderID: cs.NodeID, View: view})
+			if leader == cs.NodeID {
+				go cs.runLeaderRound()
+			} else {
+				cs.mu.Lock()
+				cs.inRound = true
+				cs.startViewTimer()
+				cs.mu.Unlock()
+			}
+		}
 	}
 }
 
-// broadcast sends msg to every currently known peer (non-blocking, one
-// goroutine per peer so a slow peer cannot block others).
-func (cs *ConsensusState) broadcast(msg Message) {
-	cs.mu.Lock()
-	targets := make([]int, 0, len(cs.peers))
-	for id := range cs.peers {
-		targets = append(targets, id)
-	}
-	cs.mu.Unlock()
-	for _, id := range targets {
-		id := id
-		go cs.sendTo(id, msg)
-	}
-}
+// ─── PEER DISCOVERY ───────────────────────────────────────────────────────────
 
-// ─── PEER DISCOVERY ──────────────────────────────────────────────────────────
-
-// discoverPeers attempts to connect to peer nodes at startup and sends HELLO
-// to every node that is already listening.
-//
-// Multi-machine mode  (id=IP args were provided):  only the configured peer
-// IDs are contacted, using their actual IP addresses.
-//
-// Same-machine mode   (no id=IP args):             scans localhost ports
-// 7001–7009 as before, so existing single-machine usage is unchanged.
+// discoverPeers attempts to connect to all configured peers.
+// Called at startup and periodically to establish connections.
 func (cs *ConsensusState) discoverPeers() {
 	cs.mu.Lock()
-	multiMachine := len(cs.nodeAddrs) > 0
-	configuredNodes := make(map[int]bool)
+	// In multi-laptop mode, try to connect to all configured peers
+	peerIDs := make([]int, 0, len(cs.nodeAddrs))
 	for id := range cs.nodeAddrs {
-		configuredNodes[id] = true
+		if id != cs.NodeID {
+			peerIDs = append(peerIDs, id)
+		}
 	}
 	cs.mu.Unlock()
 
-	if multiMachine {
-		logSys("Multi-machine mode — scanning configured nodes only...")
-	} else {
-		logSys("Scanning for peers on ports 7001–7009...")
-	}
-
-	// In multi-machine mode, only scan configured nodes.
-	// In single-machine mode, scan all IDs 1–9 on localhost.
-	candidates := make([]int, 0, 9)
-	for id := 1; id <= 9; id++ {
-		if id != cs.NodeID {
-			if multiMachine {
-				// Only add nodes that are in config
-				if configuredNodes[id] {
-					candidates = append(candidates, id)
-				}
-			} else {
-				// Single-machine: scan all
-				candidates = append(candidates, id)
+	if len(peerIDs) == 0 {
+		// Same-machine mode: try localhost ports
+		for id := 1; id <= 9; id++ {
+			if id != cs.NodeID {
+				peerIDs = append(peerIDs, id)
 			}
 		}
 	}
 
-	found := 0
-	for _, id := range candidates {
-		// Check if already known to avoid re-adding constantly
-		cs.mu.Lock()
-		_, alreadyKnown := cs.peers[id]
-		cs.mu.Unlock()
-		if alreadyKnown {
-			continue // Skip peers we already have
-		}
-
-		logNet("Trying Node %d at %s", id, cs.peerAddr(id))
-		go cs.sendTo(id, Message{Type: "HELLO", SenderID: cs.NodeID})
-		found++
-	}
-	if found == 0 {
-		logSys("No new peers to scan.")
-	} else {
-		logSys("Scanning %d configured peer(s).", found)
-		time.Sleep(1000 * time.Millisecond)
+	for _, peerID := range peerIDs {
+		go cs.tryConnectToPeer(peerID)
 	}
 }
 
-// discoveryLoop keeps trying peer discovery so nodes on different laptops can
-// still connect even if they start at different times or have transient delays.
+// tryConnectToPeer attempts to establish a connection to a peer and send HELLO.
+func (cs *ConsensusState) tryConnectToPeer(peerID int) {
+	addr := cs.peerAddr(peerID)
+	if addr == "" {
+		return
+	}
+
+	dialer := net.Dialer{Timeout: tcpDialTimeout}
+	conn, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		// Connection failed - this is normal if peer isn't running yet
+		return
+	}
+
+	// Store connection
+	connectionPoolMu.Lock()
+	if existing, exists := connectionPool[peerID]; exists {
+		existing.Close()
+	}
+	connectionPool[peerID] = conn
+	connectionPoolMu.Unlock()
+
+	// Send HELLO message to establish identity
+	msg := Message{
+		Type:       "HELLO",
+		SenderID:   cs.NodeID,
+		SenderPort: cs.Port,
+	}
+
+	encoder := json.NewEncoder(conn)
+	conn.SetWriteDeadline(time.Now().Add(tcpDialTimeout))
+	err = encoder.Encode(msg)
+	conn.SetWriteDeadline(time.Time{})
+
+	if err != nil {
+		connectionPoolMu.Lock()
+		delete(connectionPool, peerID)
+		connectionPoolMu.Unlock()
+		conn.Close()
+		return
+	}
+
+	// Start reading from this connection
+	go cs.handleConnection(conn)
+}
+
+// discoveryLoop periodically attempts to discover and connect to new peers.
+// Runs every 5 seconds to maintain connectivity.
 func (cs *ConsensusState) discoveryLoop() {
-	ticker := time.NewTicker(5 * time.Second) // Every 5 seconds - less aggressive but more reliable
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-cs.stopCh:
 			return
 		case <-ticker.C:
 			cs.discoverPeers()
-			cs.tryConnectConfigPeers() // Also try to connect to nodeAddrs
 		}
 	}
 }
 
-// tryConnectConfigPeers actively tries to connect to nodes listed in nodeAddrs
-// but not yet in peers. This ensures cross-laptop connections even if initial
-// discovery fails.
-func (cs *ConsensusState) tryConnectConfigPeers() {
-	cs.mu.Lock()
-	toTry := make([]int, 0, 9)
-	for id := 1; id <= 9; id++ {
-		if id != cs.NodeID {
-			if _, knownAddr := cs.nodeAddrs[id]; knownAddr {
-				if _, alreadyPeer := cs.peers[id]; !alreadyPeer {
-					toTry = append(toTry, id)
-				}
-			}
-		}
-	}
-	cs.mu.Unlock()
+// ─── UDP BEACON FOR LAN DISCOVERY ─────────────────────────────────────────────
 
-	if len(toTry) == 0 {
+// BeaconMessage is broadcast over UDP to help nodes find each other on the LAN.
+type BeaconMessage struct {
+	NodeID int    `json:"node_id"`
+	IP     string `json:"ip"`
+	Port   int    `json:"port"`
+}
+
+// startUDPBeacon broadcasts this node's presence on the LAN via UDP.
+// Helps nodes discover each other without manual IP configuration.
+func (cs *ConsensusState) startUDPBeacon() {
+	// Get local IP address
+	localIP := getLocalIP()
+	if localIP == "" {
+		return // Can't get local IP, skip beacon
+	}
+
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("255.255.255.255:%d", udpBeaconPort))
+	if err != nil {
 		return
 	}
 
-	for _, id := range toTry {
-		logNet("Config-connect try: Node %d at %s", id, cs.peerAddr(id))
-		go cs.sendTo(id, Message{Type: "HELLO", SenderID: cs.NodeID})
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	beacon := BeaconMessage{
+		NodeID: cs.NodeID,
+		IP:     localIP,
+		Port:   cs.Port,
+	}
+
+	ticker := time.NewTicker(udpBeaconInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-cs.stopCh:
+			return
+		case <-ticker.C:
+			data, _ := json.Marshal(beacon)
+			conn.Write(data)
+		}
 	}
 }
 
-// ─── UDP MULTICAST BEACON (Auto-Discovery on LAN) ──────────────────────────
-
-const (
-	multicastGroup = "224.0.0.100:8888"
-	beaconInterval = 2 * time.Second
-)
-
-// UDPBeacon is a lightweight peer discovery message sent via multicast.
-type UDPBeacon struct {
-	NodeID  int   `json:"node_id"`
-	TCPPort int   `json:"tcp_port"`
-	Time    int64 `json:"timestamp"`
-}
-
-// startUDPBeacon spawns a goroutine that broadcasts this node's beacon every 2s.
-// This allows nodes on the same LAN to auto-discover without config.json or IPs.
-func (cs *ConsensusState) startUDPBeacon() {
-	go func() {
-		addr, err := net.ResolveUDPAddr("udp", multicastGroup)
-		if err != nil {
-			logNet("UDP beacon disabled (ResolveUDPAddr: %v)", err)
-			return
-		}
-
-		conn, err := net.DialUDP("udp", nil, addr)
-		if err != nil {
-			logNet("UDP beacon disabled (DialUDP: %v)", err)
-			return
-		}
-		defer conn.Close()
-
-		logNet("UDP beacon enabled → broadcasting on %s", multicastGroup)
-
-		ticker := time.NewTicker(beaconInterval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-cs.stopCh:
-				return
-			case <-ticker.C:
-				beacon := UDPBeacon{
-					NodeID:  cs.NodeID,
-					TCPPort: cs.Port,
-					Time:    time.Now().Unix(),
-				}
-				data, _ := json.Marshal(beacon)
-				conn.Write(data)
-			}
-		}
-	}()
-}
-
-// listenUDPBeacon spawns a goroutine that listens for multicast beacons.
-// When beacons arrive, it auto-discovers peer addresses and initiates TCP HELLO.
+// listenUDPBeacon listens for UDP beacons from other nodes on the LAN.
+// When a beacon is received, attempts to connect to that node.
 func (cs *ConsensusState) listenUDPBeacon() {
-	go func() {
-		addr, err := net.ResolveUDPAddr("udp", multicastGroup)
-		if err != nil {
-			logNet("UDP listen disabled (ResolveUDPAddr: %v)", err)
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", udpBeaconPort))
+	if err != nil {
+		return
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	buffer := make([]byte, 1024)
+
+	for {
+		select {
+		case <-cs.stopCh:
 			return
+		default:
 		}
 
-		conn, err := net.ListenMulticastUDP("udp", nil, addr)
+		conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, _, err := conn.ReadFromUDP(buffer)
 		if err != nil {
-			logNet("UDP listen disabled (ListenMulticastUDP: %v)", err)
-			return
+			continue
 		}
-		defer conn.Close()
 
-		logNet("UDP beacon listener active on %s", multicastGroup)
-
-		buffer := make([]byte, 512)
-		for {
-			select {
-			case <-cs.stopCh:
-				return
-			default:
-				conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-				n, remoteAddr, err := conn.ReadFromUDP(buffer)
-				if err != nil {
-					continue
-				}
-
-				var beacon UDPBeacon
-				if err := json.Unmarshal(buffer[:n], &beacon); err != nil {
-					continue
-				}
-
-				if beacon.NodeID == cs.NodeID {
-					continue // ignore self
-				}
-
-				senderIP := remoteAddr.IP.String()
-				cs.handleUDPBeacon(beacon, senderIP)
-			}
+		var beacon BeaconMessage
+		if err := json.Unmarshal(buffer[:n], &beacon); err != nil {
+			continue
 		}
-	}()
+
+		// Ignore our own beacons
+		if beacon.NodeID == cs.NodeID {
+			continue
+		}
+
+		// Check if we already know about this node
+		cs.mu.Lock()
+		_, alreadyKnown := cs.nodeAddrs[beacon.NodeID]
+		cs.mu.Unlock()
+
+		if !alreadyKnown && beacon.IP != "" {
+			logNet("Discovered Node %d on LAN at %s:%d via UDP beacon", beacon.NodeID, beacon.IP, beacon.Port)
+
+			cs.mu.Lock()
+			cs.nodeAddrs[beacon.NodeID] = beacon.IP
+			cs.mu.Unlock()
+
+			// Try to connect to this newly discovered peer
+			go cs.tryConnectToPeer(beacon.NodeID)
+		}
+	}
 }
 
-// handleUDPBeacon processes a received UDP beacon and adds the sender as a peer.
-func (cs *ConsensusState) handleUDPBeacon(beacon UDPBeacon, senderIP string) {
-	cs.mu.Lock()
-	_, alreadyKnown := cs.peers[beacon.NodeID]
-	_, hasAddr := cs.nodeAddrs[beacon.NodeID]
-	cs.mu.Unlock()
-
-	if !alreadyKnown && !hasAddr {
-		// Learn new peer's IP from beacon
-		cs.mu.Lock()
-		cs.nodeAddrs[beacon.NodeID] = senderIP
-		cs.mu.Unlock()
-		logNet("UDP beacon: learned Node %d at %s", beacon.NodeID, senderIP)
+// getLocalIP returns the local non-loopback IP address.
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
 	}
 
-	// Try to send HELLO to this node
-	cs.mu.Lock()
-	_, alreadyPeer := cs.peers[beacon.NodeID]
-	cs.mu.Unlock()
-
-	if !alreadyPeer {
-		go cs.sendTo(beacon.NodeID, Message{Type: "HELLO", SenderID: cs.NodeID})
+	for _, addr := range addrs {
+		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
+			if ipNet.IP.To4() != nil {
+				return ipNet.IP.String()
+			}
+		}
 	}
+	return ""
 }
