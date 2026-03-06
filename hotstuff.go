@@ -1,45 +1,4 @@
-﻿package main
-
-// =============================================================================
-//  HotStuff BFT Consensus — Dynamic Single-File Implementation
-//
-//  No --n flag needed. Nodes discover each other automatically.
-//  Cluster size, quorum, and fault tolerance update as peers join/leave.
-//
-//  GUARANTEES:
-//    • n = 3f+1 nodes tolerate f Byzantine faults.
-//    • Quorum = 2f+1 — any two quorums share ≥1 honest node (no split commits).
-//    • Locking rule: node votes only for proposals that extend its locked block
-//      or carry a higher-view QC reference, preventing forks.
-//    • 3-chain commit: block B committed after three consecutive QC'd
-//      descendants with verified parent-child links.
-//    • View-change on timeout prevents permanent stall.
-//
-//  PROTOCOL FIXES:
-//    A) Vote-phase timeout — view advances if quorum not reached in time.
-//    B) Strict majority NO: abort immediately if >n/2 nodes reject.
-//    C) Parent-child block validation in vote check and 3-chain commit.
-//    D) Crash detection: peer removed after maxSendFailures TCP failures.
-//    E) Round restart on membership change.
-//    F) Leader = peerOrder[(view-1) % n] over sorted IDs (view 1 → node 1).
-//    G) Vote validation: SenderID == VoterID, blockID and view must match.
-//    H) All timeout paths prevent indefinite stalls.
-//
-//  HOW TO RUN — SAME MACHINE (4 terminals, no IP args needed):
-//    go run hotstuff.go network.go 1
-//    go run hotstuff.go network.go 2
-//    go run hotstuff.go network.go 3
-//    go run hotstuff.go network.go 4 -m   ← -m = Byzantine (malicious) node
-//
-//  HOW TO RUN — 4 LAPTOPS on the same LAN (replace IPs with actual ones):
-//    Laptop 1:  go run hotstuff.go network.go 1 2=192.168.1.2 3=192.168.1.3 4=192.168.1.4
-//    Laptop 2:  go run hotstuff.go network.go 2 1=192.168.1.1 3=192.168.1.3 4=192.168.1.4
-//    Laptop 3:  go run hotstuff.go network.go 3 1=192.168.1.1 2=192.168.1.2 4=192.168.1.4
-//    Laptop 4:  go run hotstuff.go network.go 4 1=192.168.1.1 2=192.168.1.2 3=192.168.1.3
-//
-//  Node IDs: 1–9   Port = 7000 + nodeID
-//  Type 'exit' at any prompt to leave gracefully.
-// =============================================================================
+package main
 
 import (
 	"bufio"
@@ -55,15 +14,11 @@ import (
 	"time"
 )
 
-//  CONFIG & TUNABLES
-
 const (
-	viewTimeout      = 20 * time.Second // replica waits this long for a proposal
-	votePhaseTimeout = 12 * time.Second // leader waits this long for votes (A)
-	maxSendFailures  = 30               // consecutive TCP failures before peer removal (D) - increased for cross-laptop
+	viewTimeout      = 20 * time.Second
+	votePhaseTimeout = 12 * time.Second
+	maxSendFailures  = 30
 )
-
-//  ANSI COLORS
 
 const (
 	cReset  = "\033[0m"
@@ -109,18 +64,15 @@ func logErr(f string, a ...any) {
 	fmt.Printf("%s[%s]%s %s[ERR]%s    %s\n", cDim, now(), cReset, cRed+cBold, cReset, fmt.Sprintf(f, a...))
 }
 
-// ─── DATA STRUCTURES ─────────────────────────────────────────────────────────
-
 type Block struct {
 	ID       int    `json:"id"`
 	ParentID int    `json:"parent_id"`
 	View     int    `json:"view"`
 	Proposer int    `json:"proposer"`
 	Data     string `json:"data"`
-	Checksum string `json:"checksum"` // CRC32 of Data; malicious nodes send a wrong value
+	Checksum string `json:"checksum"`
 }
 
-// computeChecksum returns the CRC32-IEEE hex checksum of data.
 func computeChecksum(data string) string {
 	return fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(data)))
 }
@@ -136,9 +88,9 @@ type QuorumCertificate struct {
 	BlockID   int    `json:"block_id"`
 	BlockData string `json:"block_data"`
 	View      int    `json:"view"`
-	VoteCount int    `json:"vote_count"` // total = explicit + 1 leader self-vote
-	LeaderID  int    `json:"leader_id"`  // node that formed (self-voted) this QC
-	Voters    []int  `json:"voters"`     // explicit YES voters (NOT including leader)
+	VoteCount int    `json:"vote_count"`
+	LeaderID  int    `json:"leader_id"`
+	Voters    []int  `json:"voters"`
 	FormedAt  string `json:"formed_at"`
 }
 
@@ -151,8 +103,8 @@ type Message struct {
 	Vote           *Vote              `json:"vote,omitempty"`
 	QC             *QuorumCertificate `json:"qc,omitempty"`
 	KnownPeers     []int              `json:"known_peers,omitempty"`
-	HighestQCBlock int                `json:"highest_qc_block,omitempty"` // for HELLO_ACK sync
-	NodeAddrsMap   map[int]string     `json:"node_addrs_map,omitempty"`   // IP → nodeID mapping for cross-laptop sync
+	HighestQCBlock int                `json:"highest_qc_block,omitempty"`
+	NodeAddrsMap   map[int]string     `json:"node_addrs_map,omitempty"`
 }
 
 type ConsensusState struct {
@@ -160,17 +112,15 @@ type ConsensusState struct {
 
 	NodeID    int
 	Port      int
-	malicious bool // -m flag: node exhibits Byzantine behaviour
+	malicious bool
 
-	// nodeAddrs maps nodeID → host (IP or hostname) for cross-machine deployment.
-	// If a node's ID is not present here, "localhost" is used (same-machine mode).
 	nodeAddrs map[int]string
 
 	peers     map[int]string
 	peerOrder []int
-	joinOrder []int // join-arrival order — determines round-robin leadership
+	joinOrder []int
 
-	sendFailures map[int]int // (D) per-peer consecutive TCP failure count
+	sendFailures map[int]int
 
 	currentView int
 	inRound     bool
@@ -179,8 +129,8 @@ type ConsensusState struct {
 	blocks         map[int]*Block
 	qcs            []*QuorumCertificate
 	committed      []int
-	highestQCBlock int        // blockID of the highest QC seen (parent for next proposal)
-	blockTree      *BlockTree // explicit block tree (see tree.go)
+	highestQCBlock int
+	blockTree      *BlockTree
 
 	pendingBlock   *Block
 	votesForView   map[int]bool
@@ -188,15 +138,13 @@ type ConsensusState struct {
 
 	proposalForView *Block
 
-	viewTimer      *time.Timer // (H) replica: fires if no proposal arrives
-	votePhaseTimer *time.Timer // (A) leader: fires if quorum not reached in time
+	viewTimer      *time.Timer
+	votePhaseTimer *time.Timer
 
 	listener   net.Listener
 	stopCh     chan struct{}
 	inputLines chan string
 }
-
-// ─── TIMER HELPERS ────────────────────────────────────────────────────────────
 
 func (cs *ConsensusState) startViewTimer() {
 	cs.stopViewTimer()
@@ -237,7 +185,6 @@ func (cs *ConsensusState) stopViewTimer() {
 	}
 }
 
-// startVotePhaseTimer (A) — leader fires a view change if quorum not reached.
 func (cs *ConsensusState) startVotePhaseTimer() {
 	cs.stopVotePhaseTimer()
 	capturedView := cs.currentView
@@ -278,8 +225,6 @@ func (cs *ConsensusState) stopVotePhaseTimer() {
 	}
 }
 
-// ─── CONSTRUCTOR ─────────────────────────────────────────────────────────────
-
 func newState(nodeID int, malicious bool) *ConsensusState {
 	return &ConsensusState{
 		NodeID:         nodeID,
@@ -295,7 +240,7 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 		blocks:         make(map[int]*Block),
 		qcs:            []*QuorumCertificate{},
 		committed:      []int{},
-		highestQCBlock: 0, // 0 = genesis
+		highestQCBlock: 0,
 		blockTree:      NewBlockTree(),
 		votesForView:   make(map[int]bool),
 		noVotesForView: make(map[int]bool),
@@ -304,18 +249,9 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 	}
 }
 
-// ─── CLUSTER HELPERS ─────────────────────────────────────────────────────────
-
-// rebuildOrder rebuilds peerOrder in deterministic ID order.
-// In multi-laptop mode (id=IP args), configured peers stay in the membership
-// even if temporarily unreachable, so quorum/leader do not collapse to 1/1.
-// In same-machine mode, only live peers are included.
-// IMPORTANT: When using joinOrder, we respect FIRST-COME-FIRST-SERVED (arrival) order,
-// NOT ID-sorted order. This ensures leader rotation follows actual join sequence.
 func (cs *ConsensusState) rebuildOrder() {
 	if len(cs.nodeAddrs) > 0 {
-		// Multi-laptop mode: use fixed membership so quorum does not collapse
-		// to a single node when a peer is temporarily unreachable.
+
 		members := map[int]bool{cs.NodeID: true}
 		for id := range cs.nodeAddrs {
 			if id >= 1 && id <= 9 {
@@ -332,22 +268,20 @@ func (cs *ConsensusState) rebuildOrder() {
 	}
 
 	order := make([]int, 0, len(cs.joinOrder))
-	// Both multi-machine and same-machine modes: only include nodes that have ACTUALLY joined
-	// joinOrder tracks the arrival sequence, so we respect it exactly
+
 	for _, id := range cs.joinOrder {
 		if id == cs.NodeID {
-			// Always include ourselves
+
 			order = append(order, id)
 		} else if _, ok := cs.peers[id]; ok {
-			// Only include peers that have actually connected
+
 			order = append(order, id)
 		}
 	}
-	// DO NOT sort by ID — respect arrival order for fair leader rotation
+
 	cs.peerOrder = order
 }
 
-// addToJoinOrder appends id to joinOrder if not already present.
 func (cs *ConsensusState) addToJoinOrder(id int) {
 	for _, existing := range cs.joinOrder {
 		if existing == id {
@@ -359,8 +293,6 @@ func (cs *ConsensusState) addToJoinOrder(id int) {
 
 func (cs *ConsensusState) totalNodes() int { return len(cs.peerOrder) }
 
-// leaderForView — peerOrder[(view-1) % n] in join-arrival order.
-// View 1 → first node that joined, view 2 → second, etc.
 func (cs *ConsensusState) leaderForView(view int) int {
 	if len(cs.peerOrder) == 0 {
 		return cs.NodeID
@@ -375,8 +307,7 @@ func (cs *ConsensusState) quorum() int {
 	}
 	f := (n - 1) / 3
 	q := 2*f + 1
-	// With peers present always require at least 2 votes (leader + 1 peer)
-	// so that replicas get a chance to vote before QC forms.
+
 	if q < 2 {
 		q = 2
 	}
@@ -389,8 +320,6 @@ func (cs *ConsensusState) isLeaderThisView() bool {
 	return cs.leaderForView(cs.currentView) == cs.NodeID
 }
 
-// ─── MESSAGE HANDLER ─────────────────────────────────────────────────────────
-
 func (cs *ConsensusState) handleMessage(msg Message) {
 	switch msg.Type {
 
@@ -398,12 +327,16 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		cs.mu.Lock()
 		isNew := false
 		if _, exists := cs.peers[msg.SenderID]; !exists {
-			cs.peers[msg.SenderID] = cs.peerAddr(msg.SenderID)
-			cs.addToJoinOrder(msg.SenderID) // append in arrival order (no sort)
+			host := "localhost"
+			if configured, ok := cs.nodeAddrs[msg.SenderID]; ok && configured != "" {
+				host = configured
+			}
+			cs.peers[msg.SenderID] = fmt.Sprintf("%s:%d", host, 7000+msg.SenderID)
+			cs.addToJoinOrder(msg.SenderID)
 			cs.rebuildOrder()
 			isNew = true
 		}
-		// Send the full join-ordered peerOrder so the joining node can adopt it.
+
 		orderSnap := make([]int, len(cs.peerOrder))
 		copy(orderSnap, cs.peerOrder)
 		view := cs.currentView
@@ -418,7 +351,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			cs.mu.Unlock()
 			fmt.Printf("%s%s%s\n", cGreen, bar(52), cReset)
 		}
-		// Copy nodeAddrs for exchange
+
 		addrsCopy := make(map[int]string, len(cs.nodeAddrs))
 		for id, ip := range cs.nodeAddrs {
 			addrsCopy[id] = ip
@@ -427,14 +360,14 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			Type:           "HELLO_ACK",
 			SenderID:       cs.NodeID,
 			View:           view,
-			KnownPeers:     orderSnap, // full join-ordered peer list
+			KnownPeers:     orderSnap,
 			HighestQCBlock: hqcBlock,
-			NodeAddrsMap:   addrsCopy, // share IP config
+			NodeAddrsMap:   addrsCopy,
 		})
 
 	case "HELLO_ACK":
 		cs.mu.Lock()
-		// Merge received NodeAddrsMap with our known addresses (cross-laptop sync)
+
 		if len(msg.NodeAddrsMap) > 0 {
 			for id, ip := range msg.NodeAddrsMap {
 				if id != cs.NodeID && ip != "" {
@@ -445,9 +378,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 				}
 			}
 		}
-		// Adopt the join order from the responding (existing) node.
-		// KnownPeers = their full peerOrder, already including us.
-		// Merge: trust their order first, then append any extra nodes we know.
+
 		if len(msg.KnownPeers) > 0 {
 			seen := make(map[int]bool, len(msg.KnownPeers)+len(cs.joinOrder))
 			newOrder := make([]int, 0, len(msg.KnownPeers)+len(cs.joinOrder))
@@ -457,7 +388,11 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 					newOrder = append(newOrder, id)
 					if id != cs.NodeID {
 						if _, exists := cs.peers[id]; !exists {
-							cs.peers[id] = cs.peerAddr(id)
+							host := "localhost"
+							if configured, ok := cs.nodeAddrs[id]; ok && configured != "" {
+								host = configured
+							}
+							cs.peers[id] = fmt.Sprintf("%s:%d", host, 7000+id)
 						}
 					}
 				}
@@ -471,7 +406,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			cs.joinOrder = newOrder
 			cs.rebuildOrder()
 		}
-		// Adopt sender's view and highest QC block so late-joining nodes sync up.
+
 		if msg.View > cs.currentView {
 			cs.currentView = msg.View
 		}
@@ -494,7 +429,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			return
 		}
 		blk := msg.Block
-		// (C) Parent-block existence check before accepting proposal.
+
 		if blk.ParentID != 0 {
 			if _, parentExists := cs.blocks[blk.ParentID]; !parentExists {
 				cs.mu.Unlock()
@@ -508,7 +443,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 				return
 			}
 		}
-		// Checksum validation: auto-reject if checksum does not match data.
+
 		checksumOK := blk.Checksum == "" || blk.Checksum == computeChecksum(blk.Data)
 		if !checksumOK {
 			cs.mu.Unlock()
@@ -525,7 +460,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			})
 			return
 		}
-		// Locking rule: the proposal must extend the locked block.
+
 		lockedID := cs.blockTree.LockedNodeID()
 		if lockedID != 0 && !cs.blockTree.IsAncestor(lockedID, blk.ParentID) {
 			cs.mu.Unlock()
@@ -556,18 +491,18 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			return
 		}
 		cs.mu.Lock()
-		// (G) Basic guards: must be leader, correct view, have a pending block.
+
 		if !cs.isLeaderThisView() || msg.View != cs.currentView || cs.pendingBlock == nil {
 			cs.mu.Unlock()
 			return
 		}
-		// (G) Identity: network SenderID must equal the vote's claimed VoterID.
+
 		if msg.SenderID != msg.Vote.VoterID {
 			cs.mu.Unlock()
 			logWarn("VOTE rejected: SenderID %d != VoterID %d (spoofed?)", msg.SenderID, msg.Vote.VoterID)
 			return
 		}
-		// (G) Block identity: vote must reference the exact pending block.
+
 		if msg.Vote.BlockID != cs.pendingBlock.ID {
 			cs.mu.Unlock()
 			logWarn("VOTE rejected: blockID %d != pendingBlock %d", msg.Vote.BlockID, cs.pendingBlock.ID)
@@ -577,7 +512,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		total := cs.totalNodes()
 
 		if msg.Vote.NoVote {
-			// (B) Strict majority rejection: NO > total/2 → abort immediately.
+
 			if _, already := cs.noVotesForView[voterID]; already {
 				cs.mu.Unlock()
 				return
@@ -587,13 +522,12 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			cs.mu.Unlock()
 			logVote("NO vote from Node %d  |  NO: %d  (abort threshold: >%d)", voterID, noCount, total/2)
 
-			// YES vote.
 			if _, already := cs.votesForView[voterID]; already {
 				cs.mu.Unlock()
 				return
 			}
 			cs.votesForView[voterID] = true
-			yesVotes := len(cs.votesForView) + 1 // +1 for leader implicit vote
+			yesVotes := len(cs.votesForView) + 1
 			needed := cs.quorum()
 			cs.mu.Unlock()
 			logVote("YES vote from Node %d  |  YES: %d/%d", voterID, yesVotes, needed)
@@ -617,7 +551,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 				}
 				_ = cs.blockTree.AddBlock(msg.Block)
 				cs.blockTree.MarkQC(msg.QC.BlockID)
-				// Advance highestQCBlock on receiving QC from leader.
+
 				if msg.Block.ID > cs.highestQCBlock {
 					cs.highestQCBlock = msg.Block.ID
 				}
@@ -658,8 +592,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		}
 
 	case "PREPARE":
-		// Leader tells replicas it is alive and preparing a proposal.
-		// Reset view timer so replicas don't timeout while leader takes input.
+
 		cs.mu.Lock()
 		if msg.View >= cs.currentView && !cs.isLeaderThisView() {
 			cs.currentView = msg.View
@@ -696,14 +629,11 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		}
 
 	case "PING":
-		// Health check ping - no response needed, just receiving confirms node is alive
 
 	case "LEAVE":
 		cs.removePeer(msg.SenderID, true)
 	}
 }
-
-// ─── PROPOSAL DISPLAY ────────────────────────────────────────────────────────
 
 func (cs *ConsensusState) printProposalAndPrompt(blk *Block, leaderID, view int) {
 	expected := computeChecksum(blk.Data)
@@ -725,8 +655,6 @@ func (cs *ConsensusState) printProposalAndPrompt(blk *Block, leaderID, view int)
 	fmt.Printf("%s%s%s\n", cCyan, bar(52), cReset)
 	fmt.Printf("\n%sChecksum OK — Accept proposal from leader? (y/n): %s", cGreen+cBold, cReset)
 }
-
-// ─── LEADER ROUND ─────────────────────────────────────────────────────────────
 
 func (cs *ConsensusState) runLeaderRound() {
 	time.Sleep(300 * time.Millisecond)
@@ -759,7 +687,6 @@ func (cs *ConsensusState) runLeaderRound() {
 		view, leader, total, q, f)
 	logLead("Broadcasting proposal to: %v", peers)
 
-	// Notify replicas that we are alive and preparing — resets their viewTimer.
 	cs.broadcast(Message{Type: "PREPARE", SenderID: cs.NodeID, View: view})
 
 	fmt.Printf("%s  Enter block data: %s", cYellow+cBold, cReset)
@@ -770,18 +697,18 @@ func (cs *ConsensusState) runLeaderRound() {
 	}
 
 	cs.mu.Lock()
-	// Verify we are still the leader for this view after waiting for input.
+
 	if cs.currentView != view || !cs.isLeaderThisView() {
 		cs.mu.Unlock()
 		logWarn("View changed while waiting for input — aborting proposal")
 		return
 	}
-	parentID := cs.highestQCBlock // always extend the highest QC'd block
+	parentID := cs.highestQCBlock
 	blockID := cs.nextBlockID
 	cs.nextBlockID++
 	checksum := computeChecksum(data)
 	if cs.malicious {
-		// Byzantine: deliberately corrupt the checksum so honest replicas reject.
+
 		checksum = fmt.Sprintf("%08x", rand.Uint32())
 		logWarn("[BYZANTINE] Sending corrupted checksum %s (real=%s)", checksum, computeChecksum(data))
 	}
@@ -796,7 +723,6 @@ func (cs *ConsensusState) runLeaderRound() {
 
 	cs.broadcast(Message{Type: "PROPOSE", SenderID: cs.NodeID, View: view, Block: blk})
 
-	// (A) Start vote-phase timer after broadcasting.
 	cs.mu.Lock()
 	cs.startVotePhaseTimer()
 	noPeers := len(cs.peers) == 0
@@ -810,8 +736,6 @@ func (cs *ConsensusState) runLeaderRound() {
 	}
 }
 
-// ─── FORM QC + BROADCAST ─────────────────────────────────────────────────────
-
 func (cs *ConsensusState) formAndBroadcastQC() {
 	cs.mu.Lock()
 	if cs.pendingBlock == nil {
@@ -819,7 +743,7 @@ func (cs *ConsensusState) formAndBroadcastQC() {
 		return
 	}
 	blk := cs.pendingBlock
-	voters := []int{} // explicit YES voters (leader self-vote tracked separately)
+	voters := []int{}
 	for id := range cs.votesForView {
 		voters = append(voters, id)
 	}
@@ -828,7 +752,7 @@ func (cs *ConsensusState) formAndBroadcastQC() {
 		BlockID:   blk.ID,
 		BlockData: blk.Data,
 		View:      cs.currentView,
-		VoteCount: len(voters) + 1, // +1 for leader self-vote
+		VoteCount: len(voters) + 1,
 		LeaderID:  cs.NodeID,
 		Voters:    voters,
 		FormedAt:  now(),
@@ -843,7 +767,7 @@ func (cs *ConsensusState) formAndBroadcastQC() {
 	cs.pendingBlock = nil
 	cs.votesForView = make(map[int]bool)
 	cs.noVotesForView = make(map[int]bool)
-	cs.stopVotePhaseTimer() // (A) cancel — QC formed before timeout
+	cs.stopVotePhaseTimer()
 	nextView := cs.currentView
 	nextLeader := cs.leaderForView(nextView)
 	cs.mu.Unlock()
@@ -867,8 +791,6 @@ func (cs *ConsensusState) formAndBroadcastQC() {
 	}
 }
 
-// ─── ABORT ROUND ─────────────────────────────────────────────────────────────
-
 func (cs *ConsensusState) abortRound() {
 	cs.mu.Lock()
 	if cs.pendingBlock == nil {
@@ -882,7 +804,7 @@ func (cs *ConsensusState) abortRound() {
 	cs.proposalForView = nil
 	cs.votesForView = make(map[int]bool)
 	cs.noVotesForView = make(map[int]bool)
-	cs.stopVotePhaseTimer() // (A) cancel timer on abort
+	cs.stopVotePhaseTimer()
 	nextView := cs.currentView
 	nextLeader := cs.leaderForView(nextView)
 	cs.mu.Unlock()
@@ -906,8 +828,6 @@ func (cs *ConsensusState) abortRound() {
 	}
 }
 
-// ─── QC PRINTER ───────────────────────────────────────────────────────────────
-
 func printQC(qc *QuorumCertificate) {
 	fmt.Printf("\n%s%s%s\n", cCyan+cBold, bar(52), cReset)
 	fmt.Printf("%s  QC FORMED — View %d%s\n", cCyan+cBold, qc.View, cReset)
@@ -917,7 +837,7 @@ func printQC(qc *QuorumCertificate) {
 	fmt.Printf("  %-20s %s%q%s\n", "Block Data:", cPurple, qc.BlockData, cReset)
 	explicit := qc.VoteCount - 1
 	if qc.LeaderID == 0 {
-		explicit = qc.VoteCount // legacy QC without LeaderID field
+		explicit = qc.VoteCount
 	}
 	fmt.Printf("  %-20s %d  (%d explicit + 1 leader self-vote)\n", "Vote Count:", qc.VoteCount, explicit)
 	if qc.LeaderID != 0 {
@@ -927,8 +847,6 @@ func printQC(qc *QuorumCertificate) {
 	fmt.Printf("  %-20s %s\n", "Formed At:", qc.FormedAt)
 	fmt.Printf("%s%s%s\n", cCyan+cBold, bar(52), cReset)
 }
-
-// ─── BLOCKCHAIN STATE PRINTER ───────────────────────────────────────────────
 
 func (cs *ConsensusState) printBlockchainState() {
 	cs.mu.Lock()
@@ -940,7 +858,7 @@ func (cs *ConsensusState) printBlockchainState() {
 	}
 	qcs := make([]*QuorumCertificate, len(cs.qcs))
 	copy(qcs, cs.qcs)
-	// Deep-copy blocks map so we can read it outside the lock.
+
 	blocksCopy := make(map[int]*Block, len(cs.blocks))
 	for k, v := range cs.blocks {
 		b := *v
@@ -949,17 +867,15 @@ func (cs *ConsensusState) printBlockchainState() {
 	view := cs.currentView
 	cs.mu.Unlock()
 
-	// ── Summary header ─────────────────────────────────────────────────────
 	fmt.Printf("\n%s%s%s\n", cPurple+cBold, bar(66), cReset)
 	fmt.Printf("%s  BLOCKCHAIN STATE  (view %d  |  committed: %d  |  accepted: %d)%s\n",
 		cPurple+cBold, view, len(committed), len(qcs), cReset)
 	fmt.Printf("%s%s%s\n", cPurple, bar(66), cReset)
 
-	// ── Block history table ─────────────────────────────────────────────────
 	if len(qcs) == 0 {
 		fmt.Printf("  (no blocks yet)\n")
 	} else {
-		// Header row
+
 		fmt.Printf("  %s%-4s %-6s %-7s %-7s %-5s  %-18s  %s%s\n",
 			cBold, "#", "BlkID", "Parent", "View", "Lead", "Data", "Status", cReset)
 		fmt.Printf("  %s\n", strings.Repeat("-", 64))
@@ -972,12 +888,12 @@ func (cs *ConsensusState) printBlockchainState() {
 				proposer = blk.Proposer
 				data = blk.Data
 			}
-			// Truncate data for display
+
 			displayData := fmt.Sprintf("%q", data)
 			if len(displayData) > 20 {
 				displayData = displayData[:17] + `..."`
 			}
-			// Status
+
 			var statusStr string
 			var statusColor string
 			if committedSet[qc.BlockID] {
@@ -987,7 +903,7 @@ func (cs *ConsensusState) printBlockchainState() {
 				statusStr = "accepted  ~"
 				statusColor = cCyan
 			}
-			// Voters display: leader + explicit
+
 			voterStr := ""
 			if qc.LeaderID != 0 {
 				voterStr = fmt.Sprintf("%d+%v", qc.LeaderID, qc.Voters)
@@ -999,7 +915,7 @@ func (cs *ConsensusState) printBlockchainState() {
 				displayData, statusColor, statusStr, cReset, voterStr)
 		}
 		fmt.Printf("  %s\n", strings.Repeat("-", 64))
-		// Chain summary line
+
 		chainStr := ""
 		for i, qc := range qcs {
 			if i > 0 {
@@ -1016,17 +932,10 @@ func (cs *ConsensusState) printBlockchainState() {
 	}
 	fmt.Printf("%s%s%s\n", cPurple+cBold, bar(66), cReset)
 
-	// Print the explicit block tree structure.
 	cs.mu.Lock()
 	cs.blockTree.PrintTree()
 	cs.mu.Unlock()
 }
-
-// ─── 3-CHAIN COMMIT RULE (C) ─────────────────────────────────────────────────
-//
-//  Commits block B when the last three QCs form a valid parent-child chain:
-//    blocks[qcs[i+1].BlockID].ParentID == qcs[i].BlockID
-//    blocks[qcs[i+2].BlockID].ParentID == qcs[i+1].BlockID
 
 func (cs *ConsensusState) checkAndCommit() {
 	cs.mu.Lock()
@@ -1063,7 +972,6 @@ func (cs *ConsensusState) checkAndCommit() {
 	q1 := cs.qcs[total-2]
 	q2 := cs.qcs[total-1]
 
-	// (C) Validate contiguous parent-child links in the 3-chain.
 	blk1, ok1 := cs.blocks[q1.BlockID]
 	blk2, ok2 := cs.blocks[q2.BlockID]
 	if !ok1 || !ok2 {
@@ -1084,7 +992,6 @@ func (cs *ConsensusState) checkAndCommit() {
 		return
 	}
 
-	// Already committed?
 	for _, cid := range cs.committed {
 		if cid == q0.BlockID {
 			fmt.Printf("%s%s%s\n", cCyan, bar(52), cReset)
@@ -1112,8 +1019,6 @@ func (cs *ConsensusState) checkAndCommit() {
 	logCommit("Status   : FINAL — irreversible")
 	fmt.Printf("%s%s%s\n", cPurple+cBold, bar(52), cReset)
 }
-
-// ─── TERMINAL INPUT ───────────────────────────────────────────────────────────
 
 func (cs *ConsensusState) readLine() string {
 	for {
@@ -1150,12 +1055,6 @@ func (cs *ConsensusState) inputLoop() {
 	}
 }
 
-// ─── REPLICA VOTE LOOP ────────────────────────────────────────────────────────
-
-// waitForVoteInput waits for user input on the inputLines channel, but
-// re-checks every 500ms that the proposal is still pending and this node
-// is still a replica.  This prevents the vote loop from holding onto the
-// channel when the node transitions to leader (which also reads from it).
 func (cs *ConsensusState) waitForVoteInput() (string, bool) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -1226,10 +1125,6 @@ func (cs *ConsensusState) replicaVoteLoop() {
 	}
 }
 
-// ─── PEER HEALTH CHECK ────────────────────────────────────────────────────────
-
-// peerHealthCheck periodically pings all peers to detect dead nodes faster.
-// Runs every 5 seconds and attempts to send a lightweight PING message.
 func (cs *ConsensusState) peerHealthCheck() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -1246,7 +1141,6 @@ func (cs *ConsensusState) peerHealthCheck() {
 			}
 			cs.mu.Unlock()
 
-			// Try to ping each peer
 			for _, peerID := range peerIDs {
 				go cs.sendTo(peerID, Message{
 					Type:     "PING",
@@ -1256,8 +1150,6 @@ func (cs *ConsensusState) peerHealthCheck() {
 		}
 	}
 }
-
-// ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 func main() {
 	if len(os.Args) < 2 {
@@ -1281,22 +1173,21 @@ func main() {
 		fmt.Fprintln(os.Stderr, "node_id must be 1–9")
 		os.Exit(1)
 	}
-	// Port = 7000+nodeID for consensus
+
 	malicious := false
 	peerIPs := make(map[int]string)
 
-	// Parse command-line args for peer IPs and flags
 	for _, a := range os.Args[2:] {
 		if a == "-m" {
 			malicious = true
 			continue
 		}
-		// Accept id=IP or id=IP:port (port is ignored — always 7000+id for consensus).
+
 		parts := strings.SplitN(a, "=", 2)
 		if len(parts) == 2 {
 			pid, perr := strconv.Atoi(parts[0])
 			if perr == nil && pid >= 1 && pid <= 9 && pid != nodeID {
-				// Strip optional port from the IP portion.
+
 				host := parts[1]
 				if h, _, splitErr := net.SplitHostPort(host); splitErr == nil {
 					host = h
@@ -1307,15 +1198,10 @@ func main() {
 	}
 
 	cs := newState(nodeID, malicious)
-	// Populate cross-machine addresses (empty = same-machine / localhost mode).
-	// nodeAddrs tells us WHERE to find nodes, but doesn't mean they've joined yet.
-	// Nodes are added to peers ONLY when they actually connect (first-come-first-served).
+
 	for id, ip := range peerIPs {
 		cs.nodeAddrs[id] = ip
 	}
-
-	// DO NOT pre-populate peers from config — nodes join dynamically as they start up.
-	// This ensures true first-come-first-served ordering for leader rotation.
 
 	if err := cs.startListener(); err != nil {
 		fmt.Fprintf(os.Stderr,
@@ -1350,8 +1236,8 @@ func main() {
 	go cs.inputLoop()
 	cs.discoverPeers()
 	go cs.discoveryLoop()
-	go cs.startUDPBeacon()  // Broadcast this node's address on LAN
-	go cs.listenUDPBeacon() // Listen for other nodes' beacons
+	go cs.startUDPBeacon()
+	go cs.listenUDPBeacon()
 
 	cs.mu.Lock()
 	logSys("Cluster : %v", cs.peerOrder)
@@ -1362,7 +1248,7 @@ func main() {
 	logSys("Leader for View 1 : Node %d", leader1)
 
 	go cs.replicaVoteLoop()
-	go cs.peerHealthCheck() // Periodic health check to detect dead nodes
+	go cs.peerHealthCheck()
 
 	cs.mu.Lock()
 	amLeader := cs.isLeaderThisView()
