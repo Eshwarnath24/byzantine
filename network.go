@@ -184,6 +184,7 @@ func (cs *ConsensusState) removePeer(peerID int, graceful bool) {
 func (cs *ConsensusState) discoverPeers() {
 	cs.mu.Lock()
 	peerIDs := make([]int, 0, len(cs.nodeAddrs))
+	hasConfiguredPeers := len(cs.nodeAddrs) > 0
 	for id := range cs.nodeAddrs {
 		if id != cs.NodeID {
 			if _, joined := cs.peers[id]; joined {
@@ -193,7 +194,7 @@ func (cs *ConsensusState) discoverPeers() {
 		}
 	}
 	cs.mu.Unlock()
-	if len(peerIDs) == 0 {
+	if !hasConfiguredPeers {
 		for id := 1; id <= 9; id++ {
 			if id != cs.NodeID {
 				peerIDs = append(peerIDs, id)
