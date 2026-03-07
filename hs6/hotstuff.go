@@ -105,8 +105,6 @@ type Message struct {
 	KnownPeers     []int              `json:"known_peers,omitempty"`
 	HighestQCBlock int                `json:"highest_qc_block,omitempty"`
 	NodeAddrsMap   map[int]string     `json:"node_addrs_map,omitempty"`
-	StartTimeUnix  int64              `json:"start_time_unix,omitempty"` // nanoseconds; used for join-order negotiation
-	PeerStartTimes map[int]int64      `json:"peer_start_times,omitempty"`
 }
 
 type ConsensusState struct {
@@ -120,12 +118,10 @@ type ConsensusState struct {
 
 	peers     map[int]string
 	peerOrder []int
-	joinOrder []int
 
-	sendFailures map[int]int
+	sendFailures  map[int]int
 	failureLastAt map[int]time.Time
 	helloSentAt   map[int]time.Time
-	peerStartTimes map[int]int64 // nodeID -> start time unix nano
 
 	currentView int
 	inRound     bool
@@ -149,8 +145,7 @@ type ConsensusState struct {
 	listener   net.Listener
 	stopCh     chan struct{}
 	inputLines chan string
-	proposalCh chan *Block  // signals replicaVoteLoop that a new proposal arrived
-	startTime  time.Time
+	proposalCh chan *Block // signals replicaVoteLoop that a new proposal arrived
 }
 
 func (cs *ConsensusState) startViewTimer() {
@@ -241,11 +236,9 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 		nodeAddrs:      make(map[int]string),
 		peers:          make(map[int]string),
 		peerOrder:      []int{nodeID},
-		joinOrder:      []int{nodeID},
 		sendFailures:   make(map[int]int),
 		failureLastAt:  make(map[int]time.Time),
 		helloSentAt:    make(map[int]time.Time),
-		peerStartTimes: make(map[int]int64),
 		currentView:    1,
 		nextBlockID:    1,
 		blocks:         make(map[int]*Block),
@@ -258,49 +251,19 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 		stopCh:         make(chan struct{}),
 		inputLines:     make(chan string, 64),
 		proposalCh:     make(chan *Block, 4),
-		startTime:      time.Now(),
 	}
 }
 
 func (cs *ConsensusState) rebuildOrder() {
-	// Build peerOrder sorted by start time (earliest = first = View-1 leader).
-	// This guarantees all nodes agree on the same order regardless of which
-	// node processed the HELLO/HELLO_ACK first.
-	// Tiebreaker: lower node ID wins (handles same-machine runs).
-	type entry struct {
-		id        int
-		startTime int64
+	// Build peerOrder sorted by node ID (lowest = first = View-1 leader).
+	// This is fully deterministic — every node independently computes the
+	// same order without needing to exchange timing data.
+	ids := []int{cs.NodeID}
+	for id := range cs.peers {
+		ids = append(ids, id)
 	}
-	entries := []entry{{id: cs.NodeID, startTime: cs.startTime.UnixNano()}}
-	for _, id := range cs.joinOrder {
-		if id == cs.NodeID {
-			continue
-		}
-		if _, ok := cs.peers[id]; !ok {
-			continue
-		}
-		st := cs.peerStartTimes[id] // 0 if unknown — sorts after known times
-		entries = append(entries, entry{id: id, startTime: st})
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].startTime != entries[j].startTime {
-			return entries[i].startTime < entries[j].startTime
-		}
-		return entries[i].id < entries[j].id
-	})
-	cs.peerOrder = make([]int, len(entries))
-	for i, e := range entries {
-		cs.peerOrder[i] = e.id
-	}
-}
-
-func (cs *ConsensusState) addToJoinOrder(id int) {
-	for _, existing := range cs.joinOrder {
-		if existing == id {
-			return
-		}
-	}
-	cs.joinOrder = append(cs.joinOrder, id)
+	sort.Ints(ids)
+	cs.peerOrder = ids
 }
 
 func (cs *ConsensusState) totalNodes() int { return len(cs.peerOrder) }
@@ -344,15 +307,9 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 				host = configured
 			}
 			cs.peers[msg.SenderID] = fmt.Sprintf("%s:%d", host, 7000+msg.SenderID)
-			cs.addToJoinOrder(msg.SenderID)
 			isNew = true
 		}
-		// Always record/update the sender's start time so rebuildOrder works correctly.
-		if msg.StartTimeUnix > 0 {
-			cs.peerStartTimes[msg.SenderID] = msg.StartTimeUnix
-		}
 		cs.rebuildOrder()
-
 		orderSnap := make([]int, len(cs.peerOrder))
 		copy(orderSnap, cs.peerOrder)
 		view := cs.currentView
@@ -361,12 +318,6 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		for id, ip := range cs.nodeAddrs {
 			addrsCopy[id] = ip
 		}
-		// Share all known start times so the remote can rebuild order correctly too.
-		startTimes := make(map[int]int64, len(cs.peerStartTimes)+1)
-		for id, t := range cs.peerStartTimes {
-			startTimes[id] = t
-		}
-		startTimes[cs.NodeID] = cs.startTime.UnixNano()
 		cs.mu.Unlock()
 
 		if isNew {
@@ -388,14 +339,10 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			KnownPeers:     orderSnap,
 			HighestQCBlock: hqcBlock,
 			NodeAddrsMap:   addrsCopy,
-			StartTimeUnix:  cs.startTime.UnixNano(),
-			PeerStartTimes: startTimes,
 		})
 
 	case "HELLO_ACK":
 		cs.mu.Lock()
-
-		// Register the sender as a live peer immediately.
 		isNew := false
 		if msg.SenderID > 0 {
 			if _, exists := cs.peers[msg.SenderID]; !exists {
@@ -404,21 +351,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 					host = configured
 				}
 				cs.peers[msg.SenderID] = fmt.Sprintf("%s:%d", host, 7000+msg.SenderID)
-				cs.addToJoinOrder(msg.SenderID)
 				isNew = true
-			}
-			// Record sender's own start time.
-			if msg.StartTimeUnix > 0 {
-				cs.peerStartTimes[msg.SenderID] = msg.StartTimeUnix
-			}
-		}
-
-		// Absorb all peer start times shared by the remote node.
-		for id, t := range msg.PeerStartTimes {
-			if id != cs.NodeID && t > 0 {
-				if _, exists := cs.peerStartTimes[id]; !exists {
-					cs.peerStartTimes[id] = t
-				}
 			}
 		}
 
@@ -433,26 +366,15 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			}
 		}
 
-		if len(msg.KnownPeers) > 0 {
-			// Local joinOrder is authoritative for nodes we already know.
-			// Only append peers from the remote that we haven't seen yet.
-			seen := make(map[int]bool, len(cs.joinOrder))
-			for _, id := range cs.joinOrder {
-				seen[id] = true
-			}
-			for _, id := range msg.KnownPeers {
-				if !seen[id] {
-					seen[id] = true
-					cs.joinOrder = append(cs.joinOrder, id)
-					if id != cs.NodeID {
-						if _, exists := cs.peers[id]; !exists {
-							host := "localhost"
-							if configured, ok := cs.nodeAddrs[id]; ok && configured != "" {
-								host = configured
-							}
-							cs.peers[id] = fmt.Sprintf("%s:%d", host, 7000+id)
-						}
+		// KnownPeers: register any peers we haven't heard of yet
+		for _, id := range msg.KnownPeers {
+			if id != cs.NodeID {
+				if _, exists := cs.peers[id]; !exists {
+					host := "localhost"
+					if configured, ok := cs.nodeAddrs[id]; ok && configured != "" {
+						host = configured
 					}
+					cs.peers[id] = fmt.Sprintf("%s:%d", host, 7000+id)
 				}
 			}
 		}
