@@ -204,7 +204,7 @@ func (cs *ConsensusState) removePeer(peerID int, graceful bool) {
 		logErr("Node %d removed due to connectivity failure", peerID)
 	}
 	if oldCount != newCount && newCount > 0 {
-		logSys("Cluster membership changed: %v  |  total=%d  quorum=%d  f=%d", cs.peerOrder, cs.totalNodes(), cs.quorum(), cs.faultTolerance())
+		logSys("Cluster membership changed (first-seen): %v  |  total=%d  quorum=%d  f=%d", cs.peerOrder, cs.totalNodes(), cs.quorum(), cs.faultTolerance())
 		if wasInRound || wasLeader {
 			logWarn("Restarting round due to membership change")
 			cs.broadcast(Message{Type: "NEW_VIEW", SenderID: cs.NodeID, View: view})

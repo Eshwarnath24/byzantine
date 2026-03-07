@@ -120,6 +120,7 @@ type ConsensusState struct {
 	peers     map[int]string
 	peerOrder []int
 	startOrder map[int]int64
+	orderCounter int64
 
 	sendFailures  map[int]int
 	failureLastAt map[int]time.Time
@@ -238,7 +239,8 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 		nodeAddrs:      make(map[int]string),
 		peers:          make(map[int]string),
 		peerOrder:      []int{nodeID},
-		startOrder:     map[int]int64{nodeID: time.Now().UnixNano()},
+		startOrder:     map[int]int64{nodeID: 1},
+		orderCounter:   1,
 		sendFailures:   make(map[int]int),
 		failureLastAt:  make(map[int]time.Time),
 		helloSentAt:    make(map[int]time.Time),
@@ -257,13 +259,25 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 	}
 }
 
+func (cs *ConsensusState) noteFirstSeen(id int) {
+	if id <= 0 {
+		return
+	}
+	if _, ok := cs.startOrder[id]; ok {
+		return
+	}
+	cs.orderCounter++
+	cs.startOrder[id] = cs.orderCounter
+}
+
 func (cs *ConsensusState) rebuildOrder() {
-	// Build peerOrder from startup order keys to prefer first-come leader rotation.
-	// Tie-break on node ID for deterministic behavior.
+	// Build peerOrder by first-seen order at this node (self is always first).
+	// Tie-break on node ID for deterministic local behavior.
 	ids := []int{cs.NodeID}
 	for id := range cs.peers {
 		ids = append(ids, id)
 	}
+	cs.noteFirstSeen(cs.NodeID)
 	sort.Slice(ids, func(i, j int) bool {
 		ai, aok := cs.startOrder[ids[i]]
 		bj, bok := cs.startOrder[ids[j]]
@@ -314,11 +328,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 
 	case "HELLO":
 		cs.mu.Lock()
-		if msg.StartOrderKey != 0 {
-			if existing, ok := cs.startOrder[msg.SenderID]; !ok || msg.StartOrderKey < existing {
-				cs.startOrder[msg.SenderID] = msg.StartOrderKey
-			}
-		}
+		cs.noteFirstSeen(msg.SenderID)
 		isNew := false
 		if _, exists := cs.peers[msg.SenderID]; !exists {
 			host := "localhost"
@@ -343,7 +353,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			fmt.Printf("\n%s%s%s\n", cGreen+cBold, bar(52), cReset)
 			logNet("Node %d joined the network", msg.SenderID)
 			cs.mu.Lock()
-			logSys("Cluster: %v  total=%d  quorum=%d  f=%d",
+			logSys("Cluster (first-seen): %v  total=%d  quorum=%d  f=%d",
 				cs.peerOrder, cs.totalNodes(), cs.quorum(), cs.faultTolerance())
 			cs.mu.Unlock()
 			fmt.Printf("%s%s%s\n", cGreen, bar(52), cReset)
@@ -363,11 +373,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 
 	case "HELLO_ACK":
 		cs.mu.Lock()
-		if msg.StartOrderKey != 0 {
-			if existing, ok := cs.startOrder[msg.SenderID]; !ok || msg.StartOrderKey < existing {
-				cs.startOrder[msg.SenderID] = msg.StartOrderKey
-			}
-		}
+		cs.noteFirstSeen(msg.SenderID)
 		isNew := false
 		if msg.SenderID > 0 {
 			if _, exists := cs.peers[msg.SenderID]; !exists {
@@ -394,6 +400,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		// KnownPeers: register any peers we haven't heard of yet
 		for _, id := range msg.KnownPeers {
 			if id != cs.NodeID {
+				cs.noteFirstSeen(id)
 				if _, exists := cs.peers[id]; !exists {
 					host := "localhost"
 					if configured, ok := cs.nodeAddrs[id]; ok && configured != "" {
@@ -418,7 +425,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			fmt.Printf("\n%s%s%s\n", cGreen+cBold, bar(52), cReset)
 			logNet("Node %d acknowledged (HELLO_ACK)", msg.SenderID)
 			cs.mu.Lock()
-			logSys("Cluster: %v  total=%d  quorum=%d  f=%d",
+			logSys("Cluster (first-seen): %v  total=%d  quorum=%d  f=%d",
 				cs.peerOrder, cs.totalNodes(), cs.quorum(), cs.faultTolerance())
 			cs.mu.Unlock()
 			fmt.Printf("%s%s%s\n", cGreen, bar(52), cReset)
@@ -1379,7 +1386,7 @@ func main() {
 	go cs.listenUDPBeacon()
 
 	cs.mu.Lock()
-	logSys("Cluster : %v", cs.peerOrder)
+	logSys("Cluster (first-seen) : %v", cs.peerOrder)
 	logSys("Total   : %d nodes  |  quorum=%d  f=%d",
 		cs.totalNodes(), cs.quorum(), cs.faultTolerance())
 	leader1 := cs.leaderForView(cs.currentView)
@@ -1429,7 +1436,7 @@ func main() {
 		cs.mu.Lock()
 		cs.rebuildOrder() // final order with all start times known
 		leader1 = cs.leaderForView(cs.currentView)
-		logSys("Cluster : %v", cs.peerOrder)
+		logSys("Cluster (first-seen) : %v", cs.peerOrder)
 		logSys("Total   : %d nodes  |  quorum=%d  f=%d",
 			cs.totalNodes(), cs.quorum(), cs.faultTolerance())
 		cs.mu.Unlock()
