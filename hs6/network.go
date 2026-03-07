@@ -268,10 +268,18 @@ func (cs *ConsensusState) discoverPeers() {
 }
 
 func (cs *ConsensusState) tryConnectToPeer(peerID int) {
+	cs.mu.Lock()
+	orderMapCopy := make(map[int]int64, len(cs.startOrder))
+	for id, rank := range cs.startOrder {
+		orderMapCopy[id] = rank
+	}
+	cs.mu.Unlock()
 	cs.sendTo(peerID, Message{
-		Type:       "HELLO",
-		SenderID:   cs.NodeID,
-		SenderPort: cs.Port,
+		Type:          "HELLO",
+		SenderID:      cs.NodeID,
+		SenderPort:    cs.Port,
+		StartOrderKey: cs.startOrder[cs.NodeID],
+		StartOrderMap: orderMapCopy,
 	})
 }
 

@@ -99,6 +99,7 @@ type Message struct {
 	SenderID       int                `json:"sender_id"`
 	SenderPort     int                `json:"sender_port"`
 	StartOrderKey  int64              `json:"start_order_key,omitempty"`
+	StartOrderMap  map[int]int64      `json:"start_order_map,omitempty"` // full order map shared on handshake
 	View           int                `json:"view"`
 	Block          *Block             `json:"block,omitempty"`
 	Vote           *Vote              `json:"vote,omitempty"`
@@ -264,30 +265,64 @@ func (cs *ConsensusState) noteFirstSeen(id int) {
 		return
 	}
 	if _, ok := cs.startOrder[id]; ok {
-		return
+		return // already assigned
 	}
 	cs.orderCounter++
 	cs.startOrder[id] = cs.orderCounter
 }
 
+// mergeStartOrder absorbs a remote node's startOrder map.
+// For each entry the remote sends, we keep whichever rank is LOWER (earlier).
+// This ensures the node that was first in the cluster keeps the lowest rank
+// across all machines, regardless of who learned about whom first.
+func (cs *ConsensusState) mergeStartOrder(remote map[int]int64) {
+	for id, remoteRank := range remote {
+		if id == cs.NodeID {
+			continue // never overwrite our own rank (always 1)
+		}
+		if local, ok := cs.startOrder[id]; !ok || remoteRank < local {
+			cs.startOrder[id] = remoteRank
+		}
+	}
+	// After merging, re-compact so ranks are tight (no gaps causing wrong comparisons).
+	// Collect all entries, sort by current rank, reassign 1..N preserving relative order.
+	type entry struct {
+		id   int
+		rank int64
+	}
+	entries := make([]entry, 0, len(cs.startOrder))
+	for id, rank := range cs.startOrder {
+		entries = append(entries, entry{id, rank})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].rank != entries[j].rank {
+			return entries[i].rank < entries[j].rank
+		}
+		return entries[i].id < entries[j].id
+	})
+	for i, e := range entries {
+		cs.startOrder[e.id] = int64(i + 1)
+	}
+	// Keep orderCounter consistent so future noteFirstSeen appends after current max.
+	if len(entries) > 0 {
+		cs.orderCounter = int64(len(entries))
+	}
+}
+
 func (cs *ConsensusState) rebuildOrder() {
-	// Build peerOrder by first-seen order at this node (self is always first).
-	// Tie-break on node ID for deterministic local behavior.
-	ids := []int{cs.NodeID}
+	// Build peerOrder by globally-agreed first-seen order.
+	// startOrder is merged across all nodes so every machine agrees on the same ranks.
+	// Tie-break on node ID for determinism when ranks are equal.
+	ids := make([]int, 0, 1+len(cs.peers))
+	ids = append(ids, cs.NodeID)
 	for id := range cs.peers {
 		ids = append(ids, id)
 	}
-	cs.noteFirstSeen(cs.NodeID)
 	sort.Slice(ids, func(i, j int) bool {
-		ai, aok := cs.startOrder[ids[i]]
-		bj, bok := cs.startOrder[ids[j]]
-		switch {
-		case aok && bok:
-			if ai != bj {
-				return ai < bj
-			}
-		case aok != bok:
-			return aok
+		ai := cs.startOrder[ids[i]]
+		bj := cs.startOrder[ids[j]]
+		if ai != bj {
+			return ai < bj
 		}
 		return ids[i] < ids[j]
 	})
@@ -329,6 +364,10 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 	case "HELLO":
 		cs.mu.Lock()
 		cs.noteFirstSeen(msg.SenderID)
+		// Merge any order info the sender already knows
+		if len(msg.StartOrderMap) > 0 {
+			cs.mergeStartOrder(msg.StartOrderMap)
+		}
 		isNew := false
 		if _, exists := cs.peers[msg.SenderID]; !exists {
 			host := "localhost"
@@ -346,6 +385,11 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		addrsCopy := make(map[int]string, len(cs.nodeAddrs))
 		for id, ip := range cs.nodeAddrs {
 			addrsCopy[id] = ip
+		}
+		// Share our full startOrder so the sender can merge and agree on the same order
+		orderMapCopy := make(map[int]int64, len(cs.startOrder))
+		for id, rank := range cs.startOrder {
+			orderMapCopy[id] = rank
 		}
 		cs.mu.Unlock()
 
@@ -365,6 +409,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			Type:           "HELLO_ACK",
 			SenderID:       cs.NodeID,
 			StartOrderKey:  cs.startOrder[cs.NodeID],
+			StartOrderMap:  orderMapCopy,
 			View:           view,
 			KnownPeers:     orderSnap,
 			HighestQCBlock: hqcBlock,
@@ -374,6 +419,15 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 	case "HELLO_ACK":
 		cs.mu.Lock()
 		cs.noteFirstSeen(msg.SenderID)
+		// Merge the remote's full order map — this is the key convergence step
+		if len(msg.StartOrderMap) > 0 {
+			cs.mergeStartOrder(msg.StartOrderMap)
+		} else if msg.StartOrderKey > 0 {
+			// Fallback: older node only sent StartOrderKey
+			if local, ok := cs.startOrder[msg.SenderID]; !ok || msg.StartOrderKey < local {
+				cs.startOrder[msg.SenderID] = msg.StartOrderKey
+			}
+		}
 		isNew := false
 		if msg.SenderID > 0 {
 			if _, exists := cs.peers[msg.SenderID]; !exists {
