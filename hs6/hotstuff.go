@@ -105,6 +105,8 @@ type Message struct {
 	KnownPeers     []int              `json:"known_peers,omitempty"`
 	HighestQCBlock int                `json:"highest_qc_block,omitempty"`
 	NodeAddrsMap   map[int]string     `json:"node_addrs_map,omitempty"`
+	StartTimeUnix  int64              `json:"start_time_unix,omitempty"` // nanoseconds; used for join-order negotiation
+	PeerStartTimes map[int]int64      `json:"peer_start_times,omitempty"`
 }
 
 type ConsensusState struct {
@@ -122,7 +124,8 @@ type ConsensusState struct {
 
 	sendFailures map[int]int
 	failureLastAt map[int]time.Time
-	helloSentAt   map[int]time.Time // rate-limit outbound HELLO messages
+	helloSentAt   map[int]time.Time
+	peerStartTimes map[int]int64 // nodeID -> start time unix nano
 
 	currentView int
 	inRound     bool
@@ -146,6 +149,7 @@ type ConsensusState struct {
 	listener   net.Listener
 	stopCh     chan struct{}
 	inputLines chan string
+	startTime  time.Time // used to determine join order across nodes
 }
 
 func (cs *ConsensusState) startViewTimer() {
@@ -239,6 +243,7 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 		sendFailures:   make(map[int]int),
 		failureLastAt:  make(map[int]time.Time),
 		helloSentAt:    make(map[int]time.Time),
+		peerStartTimes: make(map[int]int64),
 		currentView:    1,
 		nextBlockID:    1,
 		blocks:         make(map[int]*Block),
@@ -250,40 +255,40 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 		noVotesForView: make(map[int]bool),
 		stopCh:         make(chan struct{}),
 		inputLines:     make(chan string, 64),
+		startTime:      time.Now(),
 	}
 }
 
 func (cs *ConsensusState) rebuildOrder() {
-	if len(cs.nodeAddrs) > 0 {
-
-		members := map[int]bool{cs.NodeID: true}
-		for id := range cs.nodeAddrs {
-			if id >= 1 && id <= 9 {
-				members[id] = true
-			}
-		}
-		order := make([]int, 0, len(members))
-		for id := range members {
-			order = append(order, id)
-		}
-		sort.Ints(order)
-		cs.peerOrder = order
-		return
+	// Build peerOrder sorted by start time (earliest = first = View-1 leader).
+	// This guarantees all nodes agree on the same order regardless of which
+	// node processed the HELLO/HELLO_ACK first.
+	// Tiebreaker: lower node ID wins (handles same-machine runs).
+	type entry struct {
+		id        int
+		startTime int64
 	}
-
-	order := make([]int, 0, len(cs.joinOrder))
-
+	entries := []entry{{id: cs.NodeID, startTime: cs.startTime.UnixNano()}}
 	for _, id := range cs.joinOrder {
 		if id == cs.NodeID {
-
-			order = append(order, id)
-		} else if _, ok := cs.peers[id]; ok {
-
-			order = append(order, id)
+			continue
 		}
+		if _, ok := cs.peers[id]; !ok {
+			continue
+		}
+		st := cs.peerStartTimes[id] // 0 if unknown — sorts after known times
+		entries = append(entries, entry{id: id, startTime: st})
 	}
-
-	cs.peerOrder = order
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].startTime != entries[j].startTime {
+			return entries[i].startTime < entries[j].startTime
+		}
+		return entries[i].id < entries[j].id
+	})
+	cs.peerOrder = make([]int, len(entries))
+	for i, e := range entries {
+		cs.peerOrder[i] = e.id
+	}
 }
 
 func (cs *ConsensusState) addToJoinOrder(id int) {
@@ -337,9 +342,13 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			}
 			cs.peers[msg.SenderID] = fmt.Sprintf("%s:%d", host, 7000+msg.SenderID)
 			cs.addToJoinOrder(msg.SenderID)
-			cs.rebuildOrder()
 			isNew = true
 		}
+		// Always record/update the sender's start time so rebuildOrder works correctly.
+		if msg.StartTimeUnix > 0 {
+			cs.peerStartTimes[msg.SenderID] = msg.StartTimeUnix
+		}
+		cs.rebuildOrder()
 
 		orderSnap := make([]int, len(cs.peerOrder))
 		copy(orderSnap, cs.peerOrder)
@@ -349,7 +358,14 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		for id, ip := range cs.nodeAddrs {
 			addrsCopy[id] = ip
 		}
+		// Share all known start times so the remote can rebuild order correctly too.
+		startTimes := make(map[int]int64, len(cs.peerStartTimes)+1)
+		for id, t := range cs.peerStartTimes {
+			startTimes[id] = t
+		}
+		startTimes[cs.NodeID] = cs.startTime.UnixNano()
 		cs.mu.Unlock()
+
 		if isNew {
 			fmt.Printf("\n%s%s%s\n", cGreen+cBold, bar(52), cReset)
 			logNet("Node %d joined the network", msg.SenderID)
@@ -369,15 +385,14 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			KnownPeers:     orderSnap,
 			HighestQCBlock: hqcBlock,
 			NodeAddrsMap:   addrsCopy,
+			StartTimeUnix:  cs.startTime.UnixNano(),
+			PeerStartTimes: startTimes,
 		})
 
 	case "HELLO_ACK":
 		cs.mu.Lock()
 
-		// ── THE KEY FIX ──────────────────────────────────────────────────────
-		// Register the sender of HELLO_ACK as a live peer immediately.
-		// Without this, discoverPeers() never sees them as "joined" and keeps
-		// re-sending HELLO every 5 s, flooding the log with new connections.
+		// Register the sender as a live peer immediately.
 		isNew := false
 		if msg.SenderID > 0 {
 			if _, exists := cs.peers[msg.SenderID]; !exists {
@@ -387,8 +402,20 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 				}
 				cs.peers[msg.SenderID] = fmt.Sprintf("%s:%d", host, 7000+msg.SenderID)
 				cs.addToJoinOrder(msg.SenderID)
-				cs.rebuildOrder()
 				isNew = true
+			}
+			// Record sender's own start time.
+			if msg.StartTimeUnix > 0 {
+				cs.peerStartTimes[msg.SenderID] = msg.StartTimeUnix
+			}
+		}
+
+		// Absorb all peer start times shared by the remote node.
+		for id, t := range msg.PeerStartTimes {
+			if id != cs.NodeID && t > 0 {
+				if _, exists := cs.peerStartTimes[id]; !exists {
+					cs.peerStartTimes[id] = t
+				}
 			}
 		}
 
@@ -404,12 +431,16 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		}
 
 		if len(msg.KnownPeers) > 0 {
-			seen := make(map[int]bool, len(msg.KnownPeers)+len(cs.joinOrder))
-			newOrder := make([]int, 0, len(msg.KnownPeers)+len(cs.joinOrder))
+			// Local joinOrder is authoritative for nodes we already know.
+			// Only append peers from the remote that we haven't seen yet.
+			seen := make(map[int]bool, len(cs.joinOrder))
+			for _, id := range cs.joinOrder {
+				seen[id] = true
+			}
 			for _, id := range msg.KnownPeers {
 				if !seen[id] {
 					seen[id] = true
-					newOrder = append(newOrder, id)
+					cs.joinOrder = append(cs.joinOrder, id)
 					if id != cs.NodeID {
 						if _, exists := cs.peers[id]; !exists {
 							host := "localhost"
@@ -421,15 +452,9 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 					}
 				}
 			}
-			for _, id := range cs.joinOrder {
-				if !seen[id] {
-					seen[id] = true
-					newOrder = append(newOrder, id)
-				}
-			}
-			cs.joinOrder = newOrder
-			cs.rebuildOrder()
 		}
+
+		cs.rebuildOrder()
 
 		if msg.View > cs.currentView {
 			cs.currentView = msg.View

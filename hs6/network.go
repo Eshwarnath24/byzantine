@@ -178,6 +178,7 @@ func (cs *ConsensusState) removePeer(peerID int, graceful bool) {
 	delete(cs.peers, peerID)
 	delete(cs.sendFailures, peerID)
 	delete(cs.failureLastAt, peerID)
+	delete(cs.peerStartTimes, peerID)
 	newJoinOrder := make([]int, 0, len(cs.joinOrder))
 	for _, id := range cs.joinOrder {
 		if id != peerID {
@@ -270,7 +271,12 @@ func (cs *ConsensusState) discoverPeers() {
 }
 
 func (cs *ConsensusState) tryConnectToPeer(peerID int) {
-	cs.sendTo(peerID, Message{Type: "HELLO", SenderID: cs.NodeID, SenderPort: cs.Port})
+	cs.sendTo(peerID, Message{
+		Type:          "HELLO",
+		SenderID:      cs.NodeID,
+		SenderPort:    cs.Port,
+		StartTimeUnix: cs.startTime.UnixNano(),
+	})
 }
 
 func (cs *ConsensusState) discoveryLoop() {
