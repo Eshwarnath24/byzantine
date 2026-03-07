@@ -92,6 +92,11 @@ func (cs *ConsensusState) sendTo(peerID int, msg Message) {
 	if addr == "" {
 		return
 	}
+	if msg.StartOrderKey == 0 {
+		cs.mu.Lock()
+		msg.StartOrderKey = cs.startOrder[cs.NodeID]
+		cs.mu.Unlock()
+	}
 	dialer := &net.Dialer{
 		Timeout:   tcpDialTimeout,
 		KeepAlive: 30 * time.Second,

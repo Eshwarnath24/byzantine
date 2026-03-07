@@ -98,6 +98,7 @@ type Message struct {
 	Type           string             `json:"type"`
 	SenderID       int                `json:"sender_id"`
 	SenderPort     int                `json:"sender_port"`
+	StartOrderKey  int64              `json:"start_order_key,omitempty"`
 	View           int                `json:"view"`
 	Block          *Block             `json:"block,omitempty"`
 	Vote           *Vote              `json:"vote,omitempty"`
@@ -118,6 +119,7 @@ type ConsensusState struct {
 
 	peers     map[int]string
 	peerOrder []int
+	startOrder map[int]int64
 
 	sendFailures  map[int]int
 	failureLastAt map[int]time.Time
@@ -236,6 +238,7 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 		nodeAddrs:      make(map[int]string),
 		peers:          make(map[int]string),
 		peerOrder:      []int{nodeID},
+		startOrder:     map[int]int64{nodeID: time.Now().UnixNano()},
 		sendFailures:   make(map[int]int),
 		failureLastAt:  make(map[int]time.Time),
 		helloSentAt:    make(map[int]time.Time),
@@ -255,14 +258,25 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 }
 
 func (cs *ConsensusState) rebuildOrder() {
-	// Build peerOrder sorted by node ID (lowest = first = View-1 leader).
-	// This is fully deterministic — every node independently computes the
-	// same order without needing to exchange timing data.
+	// Build peerOrder from startup order keys to prefer first-come leader rotation.
+	// Tie-break on node ID for deterministic behavior.
 	ids := []int{cs.NodeID}
 	for id := range cs.peers {
 		ids = append(ids, id)
 	}
-	sort.Ints(ids)
+	sort.Slice(ids, func(i, j int) bool {
+		ai, aok := cs.startOrder[ids[i]]
+		bj, bok := cs.startOrder[ids[j]]
+		switch {
+		case aok && bok:
+			if ai != bj {
+				return ai < bj
+			}
+		case aok != bok:
+			return aok
+		}
+		return ids[i] < ids[j]
+	})
 	cs.peerOrder = ids
 }
 
@@ -300,6 +314,11 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 
 	case "HELLO":
 		cs.mu.Lock()
+		if msg.StartOrderKey != 0 {
+			if existing, ok := cs.startOrder[msg.SenderID]; !ok || msg.StartOrderKey < existing {
+				cs.startOrder[msg.SenderID] = msg.StartOrderKey
+			}
+		}
 		isNew := false
 		if _, exists := cs.peers[msg.SenderID]; !exists {
 			host := "localhost"
@@ -335,6 +354,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		go cs.sendTo(msg.SenderID, Message{
 			Type:           "HELLO_ACK",
 			SenderID:       cs.NodeID,
+			StartOrderKey:  cs.startOrder[cs.NodeID],
 			View:           view,
 			KnownPeers:     orderSnap,
 			HighestQCBlock: hqcBlock,
@@ -343,6 +363,11 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 
 	case "HELLO_ACK":
 		cs.mu.Lock()
+		if msg.StartOrderKey != 0 {
+			if existing, ok := cs.startOrder[msg.SenderID]; !ok || msg.StartOrderKey < existing {
+				cs.startOrder[msg.SenderID] = msg.StartOrderKey
+			}
+		}
 		isNew := false
 		if msg.SenderID > 0 {
 			if _, exists := cs.peers[msg.SenderID]; !exists {
@@ -430,11 +455,15 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 
 		checksumOK := blk.Checksum == "" || blk.Checksum == computeChecksum(blk.Data)
 		if !checksumOK {
+			expected := computeChecksum(blk.Data)
 			cs.mu.Unlock()
 			fmt.Printf("\n%s%s%s\n", cRed+cBold, bar(52), cReset)
 			logWarn("[CHECKSUM FAIL] Block %d from Node %d — expected %s, got %s",
-				blk.ID, msg.SenderID, computeChecksum(blk.Data), blk.Checksum)
+				blk.ID, msg.SenderID, expected, blk.Checksum)
 			logWarn("AUTO-REJECTING proposal (Byzantine node detected)")
+			cs.dashEvent("WARN", fmt.Sprintf("[CHECKSUM FAIL] Block %d from Node %d (view %d) — expected %s, got %s",
+				blk.ID, msg.SenderID, msg.View, expected, blk.Checksum))
+			cs.dashEvent("WARN", "AUTO-REJECTING proposal (Byzantine node detected)")
 			fmt.Printf("%s%s%s\n", cRed, bar(52), cReset)
 			go cs.sendTo(msg.SenderID, Message{
 				Type:     "VOTE",
