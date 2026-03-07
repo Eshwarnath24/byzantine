@@ -9,9 +9,11 @@ import (
 
 const (
 	tcpDialTimeout    = 5 * time.Second
+	tcpReadTimeout    = 12 * time.Second
 	httpClientTimeout = 5 * time.Second
 	udpBeaconPort     = 7999
 	udpBeaconInterval = 3 * time.Second
+	failureResetAfter = 20 * time.Second
 )
 
 func (cs *ConsensusState) startListener() error {
@@ -43,7 +45,7 @@ func (cs *ConsensusState) acceptLoop() {
 
 func (cs *ConsensusState) handleConnection(conn net.Conn) {
 	defer conn.Close()
-	_ = conn.SetReadDeadline(time.Now().Add(8 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(tcpReadTimeout))
 	dec := json.NewDecoder(conn)
 	var msg Message
 	if err := dec.Decode(&msg); err != nil {
@@ -81,16 +83,25 @@ func (cs *ConsensusState) sendTo(peerID int, msg Message) {
 	if addr == "" {
 		return
 	}
-	conn, err := (&net.Dialer{Timeout: tcpDialTimeout}).Dial("tcp4", addr)
+	dialer := &net.Dialer{
+		Timeout:   tcpDialTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+	conn, err := dialer.Dial("tcp4", addr)
 	if err != nil {
-		cs.incrementFailureCount(peerID)
+		cs.incrementFailureCount(peerID, msg.Type)
 		return
 	}
 	defer conn.Close()
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
 	enc := json.NewEncoder(conn)
 	_ = conn.SetWriteDeadline(time.Now().Add(tcpDialTimeout))
 	if err := enc.Encode(msg); err != nil {
-		cs.incrementFailureCount(peerID)
+		cs.incrementFailureCount(peerID, msg.Type)
 		return
 	}
 	cs.mu.Lock()
@@ -119,9 +130,27 @@ func (cs *ConsensusState) broadcast(msg Message) {
 	}
 }
 
-func (cs *ConsensusState) incrementFailureCount(peerID int) {
+func (cs *ConsensusState) shouldCountFailure(msgType string) bool {
+	switch msgType {
+	case "PING", "HELLO", "HELLO_ACK":
+		return false
+	default:
+		return true
+	}
+}
+
+func (cs *ConsensusState) incrementFailureCount(peerID int, msgType string) {
+	if !cs.shouldCountFailure(msgType) {
+		return
+	}
+
 	cs.mu.Lock()
+	// Avoid carrying ancient failures forever; count only recent consecutive failures.
+	if last, ok := cs.failureLastAt[peerID]; ok && time.Since(last) > failureResetAfter {
+		cs.sendFailures[peerID] = 0
+	}
 	cs.sendFailures[peerID]++
+	cs.failureLastAt[peerID] = time.Now()
 	failures := cs.sendFailures[peerID]
 	cs.mu.Unlock()
 	if failures >= maxSendFailures {
@@ -139,6 +168,7 @@ func (cs *ConsensusState) removePeer(peerID int, graceful bool) {
 	}
 	delete(cs.peers, peerID)
 	delete(cs.sendFailures, peerID)
+	delete(cs.failureLastAt, peerID)
 	newJoinOrder := make([]int, 0, len(cs.joinOrder))
 	for _, id := range cs.joinOrder {
 		if id != peerID {

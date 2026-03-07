@@ -121,6 +121,7 @@ type ConsensusState struct {
 	joinOrder []int
 
 	sendFailures map[int]int
+	failureLastAt map[int]time.Time
 
 	currentView int
 	inRound     bool
@@ -235,6 +236,7 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 		peerOrder:      []int{nodeID},
 		joinOrder:      []int{nodeID},
 		sendFailures:   make(map[int]int),
+		failureLastAt:  make(map[int]time.Time),
 		currentView:    1,
 		nextBlockID:    1,
 		blocks:         make(map[int]*Block),
