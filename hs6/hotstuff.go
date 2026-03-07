@@ -149,7 +149,8 @@ type ConsensusState struct {
 	listener   net.Listener
 	stopCh     chan struct{}
 	inputLines chan string
-	startTime  time.Time // used to determine join order across nodes
+	proposalCh chan *Block  // signals replicaVoteLoop that a new proposal arrived
+	startTime  time.Time
 }
 
 func (cs *ConsensusState) startViewTimer() {
@@ -173,6 +174,7 @@ func (cs *ConsensusState) startViewTimer() {
 		logSys("New leader: Node %d", newLeader)
 		fmt.Printf("%s%s%s\n", cYellow, bar(52), cReset)
 		cs.broadcast(Message{Type: "NEW_VIEW", SenderID: cs.NodeID, View: newView})
+		cs.drainProposalCh()
 		if newLeader == cs.NodeID {
 			go cs.runLeaderRound()
 		} else {
@@ -255,6 +257,7 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 		noVotesForView: make(map[int]bool),
 		stopCh:         make(chan struct{}),
 		inputLines:     make(chan string, 64),
+		proposalCh:     make(chan *Block, 4),
 		startTime:      time.Now(),
 	}
 }
@@ -542,8 +545,14 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			cs.nextBlockID = blk.ID + 1
 		}
 		_ = cs.blockTree.AddBlock(blk)
+		leaderOfProposal := msg.SenderID
 		cs.mu.Unlock()
-		cs.printProposalAndPrompt(blk, msg.SenderID, msg.View)
+		cs.printProposalAndPrompt(blk, leaderOfProposal, msg.View)
+		// Signal the vote loop that a fresh proposal is ready
+		select {
+		case cs.proposalCh <- blk:
+		default:
+		}
 
 	case "VOTE":
 		if msg.Vote == nil {
@@ -577,10 +586,15 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			}
 			cs.noVotesForView[voterID] = true
 			noCount := len(cs.noVotesForView)
+			// Replicas = total - 1 (leader doesn't send NO to itself)
+			replicas := total - 1
 			cs.mu.Unlock()
-			logVote("NO vote from Node %d  |  NO: %d  (abort threshold: >%d)", voterID, noCount, total/2)
+			logVote("NO vote from Node %d  |  NO: %d/%d replicas", voterID, noCount, replicas)
 
-			if noCount > total/2 {
+			// Abort immediately if ALL replicas voted NO (unanimous rejection)
+			// OR if strict majority (> half of ALL nodes) voted NO
+			if noCount >= replicas || noCount > total/2 {
+				logWarn("All replicas rejected — aborting round immediately")
 				cs.abortRound()
 			}
 			return
@@ -591,7 +605,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			return
 		}
 		cs.votesForView[voterID] = true
-		yesVotes := len(cs.votesForView) + 1
+		yesVotes := len(cs.votesForView) // leader already counted via explicit self-vote
 		needed := cs.quorum()
 		cs.mu.Unlock()
 		logVote("YES vote from Node %d  |  YES: %d/%d", voterID, yesVotes, needed)
@@ -685,6 +699,8 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			cs.stopVotePhaseTimer()
 			leader := cs.leaderForView(cs.currentView)
 			cs.mu.Unlock()
+			// Drain any stale proposal so replicaVoteLoop doesn't vote on old block
+			cs.drainProposalCh()
 			logWarn("NEW_VIEW from Node %d → view %d  |  leader: Node %d",
 				msg.SenderID, msg.View, leader)
 			cs.dashEvent("WARN", fmt.Sprintf("View change → %d (leader: Node %d)", msg.View, leader))
@@ -725,7 +741,8 @@ func (cs *ConsensusState) printProposalAndPrompt(blk *Block, leaderID, view int)
 	fmt.Printf("  %-20s %d\n", "View:", blk.View)
 	fmt.Printf("  %-20s %s\n", "Checksum:", checksumStatus)
 	fmt.Printf("%s%s%s\n", cCyan, bar(52), cReset)
-	fmt.Printf("\n%sChecksum OK — Accept proposal from leader? (y/n): %s\n> ", cGreen+cBold, cReset)
+	fmt.Printf("\n%s✓ Checksum verified — Accept this proposal? (y/n, timeout=%s): %s\n> ",
+		cGreen+cBold, votePhaseTimeout, cReset)
 	go cs.dashVotePrompt(blk, leaderID, view)
 	cs.dashEvent("VOTE", fmt.Sprintf("Proposal received — Block %d from Node %d (view %d)", blk.ID, leaderID, view))
 }
@@ -763,7 +780,7 @@ func (cs *ConsensusState) runLeaderRound() {
 
 	cs.broadcast(Message{Type: "PREPARE", SenderID: cs.NodeID, View: view})
 
-	// Drain any stale input that accumulated (e.g. accidental keypresses while waiting).
+	// Drain any stale input that accumulated while waiting.
 drainLeader:
 	for {
 		select {
@@ -772,11 +789,76 @@ drainLeader:
 			break drainLeader
 		}
 	}
-	fmt.Printf("%s  Enter block data (press Enter to auto-generate): %s\n> ", cYellow+cBold, cReset)
-	data := cs.readLine()
+
+	fmt.Printf("%s  Enter block data (timeout in %s → view change): %s\n> ", cYellow+cBold, votePhaseTimeout, cReset)
+
+	// Wait for input with a timeout. If leader doesn't type in time → view change.
+	var data string
+	inputTimeout := time.NewTimer(votePhaseTimeout)
+	defer inputTimeout.Stop()
+	inputDone := false
+	for !inputDone {
+		select {
+		case <-cs.stopCh:
+			return
+		case line := <-cs.inputLines:
+			data = strings.TrimSpace(line)
+			inputDone = true
+		case <-inputTimeout.C:
+			// Leader didn't enter data in time — trigger view change
+			cs.mu.Lock()
+			if cs.currentView != view || !cs.isLeaderThisView() {
+				cs.mu.Unlock()
+				return
+			}
+			newView := cs.currentView + 1
+			cs.currentView = newView
+			cs.inRound = false
+			newLeader := cs.leaderForView(newView)
+			cs.mu.Unlock()
+			fmt.Printf("\n%s%s%s\n", cYellow+cBold, bar(52), cReset)
+			logWarn("INPUT TIMEOUT — leader did not enter data in %s — VIEW CHANGE to view %d", votePhaseTimeout, newView)
+			logSys("New leader: Node %d", newLeader)
+			fmt.Printf("%s%s%s\n", cYellow, bar(52), cReset)
+			cs.broadcast(Message{Type: "NEW_VIEW", SenderID: cs.NodeID, View: newView})
+			if newLeader == cs.NodeID {
+				go cs.runLeaderRound()
+			} else {
+				cs.mu.Lock()
+				cs.inRound = true
+				cs.startViewTimer()
+				cs.mu.Unlock()
+			}
+			return
+		}
+	}
+
 	if data == "" {
-		data = fmt.Sprintf("block-v%d-%04d", view, rand.Intn(9999))
-		logInfo("(empty — using auto data: %s)", data)
+		// Empty enter also triggers view change — no auto-generation
+		cs.mu.Lock()
+		if cs.currentView != view || !cs.isLeaderThisView() {
+			cs.mu.Unlock()
+			return
+		}
+		newView := cs.currentView + 1
+		cs.currentView = newView
+		cs.inRound = false
+		newLeader := cs.leaderForView(newView)
+		cs.mu.Unlock()
+		fmt.Printf("\n%s%s%s\n", cYellow+cBold, bar(52), cReset)
+		logWarn("Empty input — no block proposed — VIEW CHANGE to view %d", newView)
+		logSys("New leader: Node %d", newLeader)
+		fmt.Printf("%s%s%s\n", cYellow, bar(52), cReset)
+		cs.broadcast(Message{Type: "NEW_VIEW", SenderID: cs.NodeID, View: newView})
+		if newLeader == cs.NodeID {
+			go cs.runLeaderRound()
+		} else {
+			cs.mu.Lock()
+			cs.inRound = true
+			cs.startViewTimer()
+			cs.mu.Unlock()
+		}
+		return
 	}
 
 	cs.mu.Lock()
@@ -799,6 +881,9 @@ drainLeader:
 	cs.pendingBlock = blk
 	cs.blocks[blockID] = blk
 	_ = cs.blockTree.AddBlock(blk)
+	// Leader casts its own YES vote explicitly — this makes the count honest
+	// and consistent with quorum() which counts all nodes including the leader.
+	cs.votesForView[cs.NodeID] = true
 	cs.mu.Unlock()
 
 	logLead("Proposing Block %d (parent=%d)  data=%q  checksum=%s", blk.ID, blk.ParentID, blk.Data, blk.Checksum)
@@ -835,7 +920,7 @@ func (cs *ConsensusState) formAndBroadcastQC() {
 		BlockID:   blk.ID,
 		BlockData: blk.Data,
 		View:      cs.currentView,
-		VoteCount: len(voters) + 1,
+		VoteCount: len(voters), // leader's self-vote is already in voters
 		LeaderID:  cs.NodeID,
 		Voters:    voters,
 		FormedAt:  now(),
@@ -903,6 +988,7 @@ func (cs *ConsensusState) abortRound() {
 	fmt.Printf("%s%s%s\n", cYellow, bar(52), cReset)
 
 	cs.broadcast(Message{Type: "NEW_VIEW", SenderID: cs.NodeID, View: nextView})
+	cs.drainProposalCh()
 	if nextLeader == cs.NodeID {
 		go cs.runLeaderRound()
 	} else {
@@ -920,15 +1006,11 @@ func printQC(qc *QuorumCertificate) {
 	fmt.Printf("  %-20s %d\n", "View:", qc.View)
 	fmt.Printf("  %-20s %d\n", "Block ID:", qc.BlockID)
 	fmt.Printf("  %-20s %s%q%s\n", "Block Data:", cPurple, qc.BlockData, cReset)
-	explicit := qc.VoteCount - 1
-	if qc.LeaderID == 0 {
-		explicit = qc.VoteCount
-	}
-	fmt.Printf("  %-20s %d  (%d explicit + 1 leader self-vote)\n", "Vote Count:", qc.VoteCount, explicit)
+	fmt.Printf("  %-20s %d\n", "Vote Count:", qc.VoteCount)
 	if qc.LeaderID != 0 {
-		fmt.Printf("  %-20s Node %d  %s(self-voted)%s\n", "Leader:", qc.LeaderID, cDim, cReset)
+		fmt.Printf("  %-20s Node %d\n", "Leader:", qc.LeaderID)
 	}
-	fmt.Printf("  %-20s %v\n", "Explicit Voters:", qc.Voters)
+	fmt.Printf("  %-20s %v\n", "Voters:", qc.Voters)
 	fmt.Printf("  %-20s %s\n", "Formed At:", qc.FormedAt)
 	fmt.Printf("%s%s%s\n", cCyan+cBold, bar(52), cReset)
 }
@@ -1133,74 +1215,98 @@ func (cs *ConsensusState) inputLoop() {
 	}
 }
 
+func (cs *ConsensusState) drainProposalCh() {
+	for {
+		select {
+		case <-cs.proposalCh:
+		default:
+			return
+		}
+	}
+}
+
 func (cs *ConsensusState) replicaVoteLoop() {
 	for {
+		// Wait for a proposal to arrive via proposalCh
+		var blk *Block
 		select {
 		case <-cs.stopCh:
 			return
-		default:
+		case blk = <-cs.proposalCh:
 		}
 
+		// Sanity check — if we became leader while waiting, ignore
 		cs.mu.Lock()
-		proposal := cs.proposalForView
 		isLeader := cs.isLeaderThisView()
+		stillMine := cs.proposalForView != nil && cs.proposalForView.ID == blk.ID
 		cs.mu.Unlock()
-
-		// Only consume stdin when we are a replica AND have a pending proposal.
-		// When we are the leader, runLeaderRound() owns stdin — do not touch inputLines.
-		if proposal == nil || isLeader {
-			time.Sleep(100 * time.Millisecond)
+		if isLeader || !stillMine {
 			continue
 		}
 
-		// Wait for user to type y/n, but bail out if proposal disappears
-		// (e.g. view changed while waiting).
+		// Wait for user input (y/n), but abandon if view changes or timeout
 		var answer string
 		waitDone := false
+		voteTimeout := time.NewTimer(votePhaseTimeout)
+		defer voteTimeout.Stop()
 		for !waitDone {
 			select {
 			case <-cs.stopCh:
 				return
 			case line := <-cs.inputLines:
 				answer = strings.ToLower(strings.TrimSpace(line))
+				if answer != "" {
+					waitDone = true
+				}
+			case <-voteTimeout.C:
+				logWarn("Vote timeout — no input received in %s — treating as NO vote", votePhaseTimeout)
+				answer = "n"
 				waitDone = true
-			case <-time.After(200 * time.Millisecond):
+			case <-time.After(300 * time.Millisecond):
 				cs.mu.Lock()
-				stillValid := cs.proposalForView != nil && !cs.isLeaderThisView()
+				stillValid := cs.proposalForView != nil &&
+					cs.proposalForView.ID == blk.ID &&
+					!cs.isLeaderThisView()
 				cs.mu.Unlock()
 				if !stillValid {
-					waitDone = true // proposal gone (view changed), abandon
+					waitDone = true // view changed or proposal gone — abandon
 				}
 			}
 		}
 
 		if answer == "" {
-			// proposal was revoked before user answered
+			// Proposal was revoked (view changed) before user answered
 			continue
 		}
 
+		// Re-check the proposal is still valid before sending vote
 		cs.mu.Lock()
-		if cs.proposalForView == nil {
+		if cs.proposalForView == nil || cs.proposalForView.ID != blk.ID {
 			cs.mu.Unlock()
-			continue
+			continue // proposal already gone
 		}
-		blk := cs.proposalForView
 		view := blk.View
 		leaderID := blk.Proposer
-		cs.proposalForView = nil
+		cs.proposalForView = nil // clear only after we have committed to voting
 		cs.mu.Unlock()
 
 		if answer == "y" || answer == "yes" {
 			logVote("Sending YES vote for Block %d to Node %d", blk.ID, leaderID)
+			cs.dashEvent("VOTE", fmt.Sprintf("You voted YES for Block %d", blk.ID))
 			go cs.sendTo(leaderID, Message{
-				Type: "VOTE", SenderID: cs.NodeID, View: view,
-				Vote: &Vote{VoterID: cs.NodeID, BlockID: blk.ID, View: view},
+				Type:     "VOTE",
+				SenderID: cs.NodeID,
+				View:     view,
+				Vote:     &Vote{VoterID: cs.NodeID, BlockID: blk.ID, View: view},
 			})
 		} else {
 			logVote("Sending NO vote for Block %d to Node %d", blk.ID, leaderID)
+			cs.dashEvent("VOTE", fmt.Sprintf("You voted NO for Block %d", blk.ID))
 			go cs.sendTo(leaderID, Message{
-				Type: "VOTE", SenderID: cs.NodeID, View: view,
-				Vote: &Vote{VoterID: cs.NodeID, BlockID: blk.ID, View: view, NoVote: true},
+				Type:     "VOTE",
+				SenderID: cs.NodeID,
+				View:     view,
+				Vote:     &Vote{VoterID: cs.NodeID, BlockID: blk.ID, View: view, NoVote: true},
 			})
 		}
 	}
@@ -1333,7 +1439,12 @@ func main() {
 	go cs.peerHealthCheck()
 
 	if len(cs.nodeAddrs) > 0 {
-		logInfo("Waiting for at least one peer connection before starting consensus...")
+		expectedPeers := len(cs.nodeAddrs) // number of peers configured on cmd line
+		logInfo("Waiting for all %d configured peers to connect before starting consensus...", expectedPeers)
+
+		// Phase 1: wait until ALL configured peers are connected, or 15 s timeout.
+		// 15 s is generous — if a node never shows up we still start with whoever is here.
+		deadline := time.Now().Add(15 * time.Second)
 		for {
 			select {
 			case <-cs.stopCh:
@@ -1341,14 +1452,31 @@ func main() {
 			default:
 			}
 			cs.mu.Lock()
-			ready := len(cs.peers) > 0
+			got := len(cs.peers)
 			cs.mu.Unlock()
-			if ready {
+			if got >= expectedPeers {
 				break
 			}
-			time.Sleep(300 * time.Millisecond)
+			if time.Now().After(deadline) {
+				cs.mu.Lock()
+				got = len(cs.peers)
+				cs.mu.Unlock()
+				if got == 0 {
+					logWarn("No peers connected after 15s — continuing alone (single-node mode)")
+				} else {
+					logWarn("Only %d/%d peers connected after 15s — starting with current cluster", got, expectedPeers)
+				}
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
 		}
+
+		// Phase 2: give an extra 1 s for HELLO_ACK start-times to propagate
+		// so rebuildOrder() has complete data for all connected peers.
+		time.Sleep(1 * time.Second)
+
 		cs.mu.Lock()
+		cs.rebuildOrder() // final order with all start times known
 		leader1 = cs.leaderForView(cs.currentView)
 		logSys("Cluster : %v", cs.peerOrder)
 		logSys("Total   : %d nodes  |  quorum=%d  f=%d",
