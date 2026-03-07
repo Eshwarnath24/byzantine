@@ -358,6 +358,8 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 				cs.peerOrder, cs.totalNodes(), cs.quorum(), cs.faultTolerance())
 			cs.mu.Unlock()
 			fmt.Printf("%s%s%s\n", cGreen, bar(52), cReset)
+			cs.dashEvent("NET", fmt.Sprintf("Node %d joined the cluster", msg.SenderID))
+			go cs.dashPushState()
 		}
 
 		go cs.sendTo(msg.SenderID, Message{
@@ -568,6 +570,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		needed := cs.quorum()
 		cs.mu.Unlock()
 		logVote("YES vote from Node %d  |  YES: %d/%d", voterID, yesVotes, needed)
+		cs.dashEvent("VOTE", fmt.Sprintf("YES vote from Node %d  (%d/%d)", voterID, yesVotes, needed))
 
 		if yesVotes >= needed {
 			cs.formAndBroadcastQC()
@@ -659,6 +662,7 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 			cs.mu.Unlock()
 			logWarn("NEW_VIEW from Node %d → view %d  |  leader: Node %d",
 				msg.SenderID, msg.View, leader)
+			cs.dashEvent("WARN", fmt.Sprintf("View change → %d (leader: Node %d)", msg.View, leader))
 			if leader == cs.NodeID {
 				go cs.runLeaderRound()
 			} else {
@@ -697,6 +701,8 @@ func (cs *ConsensusState) printProposalAndPrompt(blk *Block, leaderID, view int)
 	fmt.Printf("  %-20s %s\n", "Checksum:", checksumStatus)
 	fmt.Printf("%s%s%s\n", cCyan, bar(52), cReset)
 	fmt.Printf("\n%sChecksum OK — Accept proposal from leader? (y/n): %s\n> ", cGreen+cBold, cReset)
+	go cs.dashVotePrompt(blk, leaderID, view)
+	cs.dashEvent("VOTE", fmt.Sprintf("Proposal received — Block %d from Node %d (view %d)", blk.ID, leaderID, view))
 }
 
 func (cs *ConsensusState) runLeaderRound() {
@@ -828,6 +834,8 @@ func (cs *ConsensusState) formAndBroadcastQC() {
 	printQC(qc)
 	cs.printBlockchainState()
 	cs.broadcast(Message{Type: "QC", SenderID: cs.NodeID, View: qc.View, Block: blk, QC: qc})
+	cs.dashEvent("QC", fmt.Sprintf("QC formed for Block %d — view %d — %d votes", qc.BlockID, qc.View, qc.VoteCount))
+	go cs.dashPushState()
 
 	fmt.Printf("\n%s%s%s\n", cCyan, bar(52), cReset)
 	logSys("View %d complete → View %d  |  Leader: Node %d", nextView-1, nextView, nextLeader)
@@ -1058,6 +1066,7 @@ func (cs *ConsensusState) checkAndCommit() {
 	if blk != nil {
 		dataStr = blk.Data
 	}
+	cs.dashEvent("COMMIT", fmt.Sprintf("Block %d committed — data: %q", q0.BlockID, dataStr))
 
 	logQC("3-chain rule satisfied ✓  (parent-child links verified)")
 	fmt.Printf("%s%s%s\n", cCyan, bar(52), cReset)
@@ -1281,6 +1290,7 @@ func main() {
 	fmt.Printf("\n%s  Type 'exit' at any time to leave the cluster.%s\n\n", cDim, cReset)
 
 	go cs.inputLoop()
+	cs.startDashboard()
 	cs.discoverPeers()
 	go cs.discoveryLoop()
 	go cs.startUDPBeacon()
