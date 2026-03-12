@@ -94,7 +94,7 @@ func (cs *ConsensusState) sendTo(peerID int, msg Message) {
 	}
 	if msg.StartOrderKey == 0 {
 		cs.mu.Lock()
-		msg.StartOrderKey = cs.startOrder[cs.NodeID]
+		msg.StartOrderKey = cs.myStartTime
 		cs.mu.Unlock()
 	}
 	dialer := &net.Dialer{
@@ -269,17 +269,18 @@ func (cs *ConsensusState) discoverPeers() {
 
 func (cs *ConsensusState) tryConnectToPeer(peerID int) {
 	cs.mu.Lock()
-	orderMapCopy := make(map[int]int64, len(cs.startOrder))
-	for id, rank := range cs.startOrder {
-		orderMapCopy[id] = rank
+	timeMapCopy := make(map[int]int64, len(cs.startTime))
+	for id, t := range cs.startTime {
+		timeMapCopy[id] = t
 	}
+	myTime := cs.myStartTime
 	cs.mu.Unlock()
 	cs.sendTo(peerID, Message{
 		Type:          "HELLO",
 		SenderID:      cs.NodeID,
 		SenderPort:    cs.Port,
-		StartOrderKey: cs.startOrder[cs.NodeID],
-		StartOrderMap: orderMapCopy,
+		StartOrderKey: myTime,
+		StartOrderMap: timeMapCopy,
 	})
 }
 

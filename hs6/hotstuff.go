@@ -120,8 +120,11 @@ type ConsensusState struct {
 
 	peers     map[int]string
 	peerOrder []int
-	startOrder map[int]int64
-	orderCounter int64
+	// startTime[id] = UnixNano when that node booted.
+	// Smaller value = started earlier = earlier in leader rotation.
+	// Shared via HELLO/HELLO_ACK so every node converges on the same order.
+	startTime    map[int]int64
+	myStartTime  int64 // this node's own boot time, never overwritten
 
 	sendFailures  map[int]int
 	failureLastAt map[int]time.Time
@@ -233,6 +236,7 @@ func (cs *ConsensusState) stopVotePhaseTimer() {
 }
 
 func newState(nodeID int, malicious bool) *ConsensusState {
+	bootTime := time.Now().UnixNano()
 	return &ConsensusState{
 		NodeID:         nodeID,
 		Port:           7000 + nodeID,
@@ -240,8 +244,8 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 		nodeAddrs:      make(map[int]string),
 		peers:          make(map[int]string),
 		peerOrder:      []int{nodeID},
-		startOrder:     map[int]int64{nodeID: 1},
-		orderCounter:   1,
+		startTime:      map[int]int64{nodeID: bootTime},
+		myStartTime:    bootTime,
 		sendFailures:   make(map[int]int),
 		failureLastAt:  make(map[int]time.Time),
 		helloSentAt:    make(map[int]time.Time),
@@ -260,69 +264,52 @@ func newState(nodeID int, malicious bool) *ConsensusState {
 	}
 }
 
+// noteFirstSeen records a peer's boot time only if we don't know it yet.
+// The actual boot time arrives via StartOrderMap in HELLO/HELLO_ACK.
+// This is a fallback that assigns current time (will be overridden by merge).
 func (cs *ConsensusState) noteFirstSeen(id int) {
 	if id <= 0 {
 		return
 	}
-	if _, ok := cs.startOrder[id]; ok {
-		return // already assigned
+	if _, ok := cs.startTime[id]; ok {
+		return // already have real boot time
 	}
-	cs.orderCounter++
-	cs.startOrder[id] = cs.orderCounter
+	// We don't know their real boot time yet; use current time as placeholder.
+	// It will be overwritten when we receive their StartOrderMap.
+	cs.startTime[id] = time.Now().UnixNano()
 }
 
-// mergeStartOrder absorbs a remote node's startOrder map.
-// For each entry the remote sends, we keep whichever rank is LOWER (earlier).
-// This ensures the node that was first in the cluster keeps the lowest rank
-// across all machines, regardless of who learned about whom first.
-func (cs *ConsensusState) mergeStartOrder(remote map[int]int64) {
-	for id, remoteRank := range remote {
+// mergeStartTimes absorbs a remote node's boot-time map.
+// For each peer, keep whichever boot time is EARLIER (smaller UnixNano).
+// Never overwrite our own boot time.
+func (cs *ConsensusState) mergeStartTimes(remote map[int]int64) {
+	for id, remoteTime := range remote {
 		if id == cs.NodeID {
-			continue // never overwrite our own rank (always 1)
+			continue // never overwrite our own boot time
 		}
-		if local, ok := cs.startOrder[id]; !ok || remoteRank < local {
-			cs.startOrder[id] = remoteRank
+		if remoteTime <= 0 {
+			continue
 		}
-	}
-	// After merging, re-compact so ranks are tight (no gaps causing wrong comparisons).
-	// Collect all entries, sort by current rank, reassign 1..N preserving relative order.
-	type entry struct {
-		id   int
-		rank int64
-	}
-	entries := make([]entry, 0, len(cs.startOrder))
-	for id, rank := range cs.startOrder {
-		entries = append(entries, entry{id, rank})
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].rank != entries[j].rank {
-			return entries[i].rank < entries[j].rank
+		if local, ok := cs.startTime[id]; !ok || remoteTime < local {
+			cs.startTime[id] = remoteTime
 		}
-		return entries[i].id < entries[j].id
-	})
-	for i, e := range entries {
-		cs.startOrder[e.id] = int64(i + 1)
-	}
-	// Keep orderCounter consistent so future noteFirstSeen appends after current max.
-	if len(entries) > 0 {
-		cs.orderCounter = int64(len(entries))
 	}
 }
 
 func (cs *ConsensusState) rebuildOrder() {
-	// Build peerOrder by globally-agreed first-seen order.
-	// startOrder is merged across all nodes so every machine agrees on the same ranks.
-	// Tie-break on node ID for determinism when ranks are equal.
+	// Build peerOrder sorted by boot time (UnixNano, smaller = earlier = first leader).
+	// Tie-break on node ID for same-machine runs where clocks are identical.
+	// Every node converges on the same order because boot times are shared and merged.
 	ids := make([]int, 0, 1+len(cs.peers))
 	ids = append(ids, cs.NodeID)
 	for id := range cs.peers {
 		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool {
-		ai := cs.startOrder[ids[i]]
-		bj := cs.startOrder[ids[j]]
-		if ai != bj {
-			return ai < bj
+		ti := cs.startTime[ids[i]]
+		tj := cs.startTime[ids[j]]
+		if ti != tj {
+			return ti < tj
 		}
 		return ids[i] < ids[j]
 	})
@@ -363,11 +350,11 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 
 	case "HELLO":
 		cs.mu.Lock()
-		cs.noteFirstSeen(msg.SenderID)
-		// Merge any order info the sender already knows
+		// Merge boot times first so noteFirstSeen placeholder is overridden immediately
 		if len(msg.StartOrderMap) > 0 {
-			cs.mergeStartOrder(msg.StartOrderMap)
+			cs.mergeStartTimes(msg.StartOrderMap)
 		}
+		cs.noteFirstSeen(msg.SenderID)
 		isNew := false
 		if _, exists := cs.peers[msg.SenderID]; !exists {
 			host := "localhost"
@@ -386,10 +373,10 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		for id, ip := range cs.nodeAddrs {
 			addrsCopy[id] = ip
 		}
-		// Share our full startOrder so the sender can merge and agree on the same order
-		orderMapCopy := make(map[int]int64, len(cs.startOrder))
-		for id, rank := range cs.startOrder {
-			orderMapCopy[id] = rank
+		// Share our full startTime map so the sender can merge and agree on the same order
+		timeMapCopy := make(map[int]int64, len(cs.startTime))
+		for id, t := range cs.startTime {
+			timeMapCopy[id] = t
 		}
 		cs.mu.Unlock()
 
@@ -408,8 +395,8 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 		go cs.sendTo(msg.SenderID, Message{
 			Type:           "HELLO_ACK",
 			SenderID:       cs.NodeID,
-			StartOrderKey:  cs.startOrder[cs.NodeID],
-			StartOrderMap:  orderMapCopy,
+			StartOrderKey:  cs.myStartTime,
+			StartOrderMap:  timeMapCopy,
 			View:           view,
 			KnownPeers:     orderSnap,
 			HighestQCBlock: hqcBlock,
@@ -418,16 +405,16 @@ func (cs *ConsensusState) handleMessage(msg Message) {
 
 	case "HELLO_ACK":
 		cs.mu.Lock()
-		cs.noteFirstSeen(msg.SenderID)
-		// Merge the remote's full order map — this is the key convergence step
+		// Merge boot times FIRST so noteFirstSeen placeholder is overridden
 		if len(msg.StartOrderMap) > 0 {
-			cs.mergeStartOrder(msg.StartOrderMap)
+			cs.mergeStartTimes(msg.StartOrderMap)
 		} else if msg.StartOrderKey > 0 {
-			// Fallback: older node only sent StartOrderKey
-			if local, ok := cs.startOrder[msg.SenderID]; !ok || msg.StartOrderKey < local {
-				cs.startOrder[msg.SenderID] = msg.StartOrderKey
+			// Fallback: remote only sent StartOrderKey (their boot time)
+			if local, ok := cs.startTime[msg.SenderID]; !ok || msg.StartOrderKey < local {
+				cs.startTime[msg.SenderID] = msg.StartOrderKey
 			}
 		}
+		cs.noteFirstSeen(msg.SenderID)
 		isNew := false
 		if msg.SenderID > 0 {
 			if _, exists := cs.peers[msg.SenderID]; !exists {
